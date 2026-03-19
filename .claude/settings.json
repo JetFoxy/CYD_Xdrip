@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//dev/**)",
+      "Bash(pio run:*)",
+      "Read(//Users/jetcat/.platformio/penv/bin/**)",
+      "Bash(/Users/jetcat/.platformio/penv/bin/platformio run:*)"
+    ]
+  }
+}

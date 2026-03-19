@@ -1,0 +1,17 @@
+# PlatformIO
+.pio/
+
+# VSCode
+.vscode/
+
+# SD card config (may contain password)
+CYD.INI
+M5NS.INI
+
+# macOS
+.DS_Store
+
+# Compiled artifacts
+*.bin
+*.elf
+*.map
