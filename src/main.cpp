@@ -27,7 +27,8 @@
 #include <SPI.h>
 #include "time.h"
 #include "Free_Fonts.h"
-#include "M5NSconfig.h"
+#include "CYDconfig.h"
+#include "WebConfig.h"
 #include <cstring>
 #include <string>
 
@@ -502,22 +503,28 @@ void updateGlycemia() {
 // ---- WiFi + Nightscout ----
 
 void setupWifi() {
+  // Always start configuration AP so the web interface is reachable at 192.168.4.1
+  WiFi.mode(cfg.wifi_ssid[0] ? WIFI_AP_STA : WIFI_AP);
+  WiFi.softAP("CYDrip-Setup");
+  Serial.println(F("Config AP started: CYDrip-Setup / 192.168.4.1"));
+
   if (cfg.wifi_ssid[0] == '\0') return;
+
   Serial.printf("Connecting to WiFi: %s\n", cfg.wifi_ssid);
   tft.println(F("Connecting WiFi..."));
-  WiFi.mode(WIFI_STA);
   WiFi.begin(cfg.wifi_ssid, cfg.wifi_password);
   unsigned long t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < 10000UL)
     delay(200);
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("WiFi failed, continuing without"));
+    Serial.println(F("WiFi STA failed, AP-only mode"));
     return;
   }
   wifiEnabled = true;
   Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
-  // NTP sync — use UTC offset from config
-  configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
+  // NTP — use configured server, fallback to pool.ntp.org
+  const char *ntpSrv = cfg.ntp_server[0] ? cfg.ntp_server : "pool.ntp.org";
+  configTime(utcOffsetSec, 0, ntpSrv, "time.google.com");
   struct tm t2;
   if (getLocalTime(&t2, 5000)) {
     ntpSynced = true;
@@ -785,11 +792,13 @@ void setup() {
 
   loadHistoryFromNVS();
 
+  // Load config: NVS first (web-configured), then SD card overrides if present
+  loadCYDConfigFromNVS(cfg);
   if (SD.begin(SD_CS_PIN)) {
     Serial.println(F("SD card OK"));
-    readConfiguration("/CYD.INI", &cfg);
+    readCYDConfig("/CYD.INI", &cfg);
   } else {
-    Serial.println(F("SD card not found, using defaults"));
+    Serial.println(F("SD card not found"));
   }
   // Apply config values
   utcOffsetSec = (long)cfg.utc_offset_min * 60L;
@@ -801,6 +810,8 @@ void setup() {
 
   Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
   setupWifi();
+  webConfigBegin(cfg, tft, displayColorsInverted);
+  tft.println(F("Config: 192.168.4.1"));
   tft.println(F("Waiting for CYDDrip..."));
   setupBLE();
 }
@@ -808,6 +819,7 @@ void setup() {
 // ---- Main loop ----
 
 void loop() {
+  webConfigHandle();
   handleBrightnessButton();
   handleAlarmButton();
   checkAlarms();
