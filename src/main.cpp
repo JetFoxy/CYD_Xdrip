@@ -99,6 +99,9 @@ static unsigned long bleTimestampSec    = 0;  // local time at last BLE update
 static unsigned long bleTimestampMillis = 0;  // millis() at that moment
 static long          utcOffsetSec       = 0;  // UTC offset in seconds
 
+// Pending BLE update — set from BLE task, consumed in main loop to avoid concurrent TFT access
+static volatile bool bleDataReady = false;
+
 struct NSinfo {
   time_t   sensTime        = 0;
   char     sensDir[32]     = {};
@@ -265,7 +268,7 @@ unsigned long getLocalTimeInSeconds() {
   // NTP (WiFi) takes priority — most accurate
   if (ntpSynced) {
     struct tm t;
-    if (getLocalTime(&t, 100)) return (unsigned long)mktime(&t);
+    if (getLocalTime(&t, 100)) return (unsigned long)mktime(&t) + utcOffsetSec;
   }
   // Fall back to BLE time sync
   if (bleTimestampSec > 0)
@@ -690,8 +693,9 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
         bool     isMgdl = (flags & 0x01) != 0;
         bool     isStale = (flags & 0x02) != 0;
 
-        // Sync local clock from UTC offset (bytes 13-14, int16 minutes)
-        if (rxLen >= 15) {
+        // Sync local clock from UTC offset (bytes 13-14, int16 minutes).
+        // Only apply BLE-provided offset if not set in config file — config takes priority.
+        if (rxLen >= 15 && cfg.utc_offset_min == 0) {
           int16_t offsetMin = (int16_t(rxBuf[13]) << 8) | rxBuf[14];
           utcOffsetSec = (long)offsetMin * 60L;
         }
@@ -737,8 +741,7 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
         ns.cob = (rxLen >= 26) ? rxBuf[25] : 0;
 
         if (!isStale) pushReadingToHistory(ns.sensSgv);
-        updateGlycemia();
-        msCount = millis();
+        bleDataReady = true;  // signal main loop to redraw (avoids concurrent TFT access)
       } break;
     }
   }
@@ -836,7 +839,8 @@ void loop() {
       (elapsed > 120000UL) ||
       (elapsed > 15000UL  && utc > 0 &&
        utc - timeStampLatestBgReadingInSecondsUTC > 120UL);
-  if (shouldUpdate) {
+  if (bleDataReady || shouldUpdate) {
+    bleDataReady = false;
     updateGlycemia();
     msCount = millis();
   }
