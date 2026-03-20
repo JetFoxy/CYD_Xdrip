@@ -16,7 +16,7 @@
 
 // ESP32-2432S028: backlight on GPIO 21, active HIGH
 #define TFT_BL_PIN      21
-#define BOOT_BTN_PIN     0   // BOOT button — cycle brightness (fallback)
+#define BOOT_BTN_PIN     0   // BOOT button — short press brightness, long press orientation
 #define BTN_BRIGHTNESS  27   // P3 pin 1 — cycle brightness
 #define BTN_ALARM_RESET 22   // P3 pin 2 — silence alarm
 #define SPEAKER_PIN     26   // CN1 speaker via on-board amplifier
@@ -102,6 +102,27 @@ static long          utcOffsetSec       = 0;  // UTC offset in seconds
 // Pending BLE update — set from BLE task, consumed in main loop to avoid concurrent TFT access
 static volatile bool bleDataReady = false;
 
+// Display orientation
+static bool isPortrait = false;  // false = landscape (default)
+
+void saveRotationToNVS(bool portrait) {
+  preferences.begin("cydui", false);
+  preferences.putBool("portrait", portrait);
+  preferences.end();
+}
+
+bool loadRotationFromNVS() {
+  preferences.begin("cydui", true);
+  bool v = preferences.getBool("portrait", false);
+  preferences.end();
+  return v;
+}
+
+void applyRotation(bool portrait) {
+  isPortrait = portrait;
+  tft.setRotation(portrait ? 2 : 1);
+}
+
 struct NSinfo {
   time_t   sensTime        = 0;
   char     sensDir[32]     = {};
@@ -168,15 +189,40 @@ void cycleBrightness() {
   ledcWrite(0, BL_LEVELS[blLevelIdx]);
 }
 
+static void toggleOrientation() {
+  isPortrait = !isPortrait;
+  saveRotationToNVS(isPortrait);
+  applyRotation(isPortrait);
+  updateGlycemia();
+  msCount = millis();
+}
+
 void handleBrightnessButton() {
-  static bool lastBoot = HIGH;
-  static bool lastP3   = HIGH;
-  bool b = digitalRead(BOOT_BTN_PIN);
-  bool p = digitalRead(BTN_BRIGHTNESS);
-  if ((lastBoot == HIGH && b == LOW) || (lastP3 == HIGH && p == LOW))
-    cycleBrightness();
-  lastBoot = b;
-  lastP3   = p;
+  // BTN_BRIGHTNESS (pin 27): short press = brightness, long press = orientation
+  {
+    static bool          pressing   = false;
+    static unsigned long pressStart = 0;
+    bool p = (digitalRead(BTN_BRIGHTNESS) == LOW);
+    if (!pressing && p) { pressing = true; pressStart = millis(); }
+    else if (pressing && !p) {
+      pressing = false;
+      if (millis() - pressStart >= 800) toggleOrientation();
+      else                              cycleBrightness();
+    }
+  }
+
+  // BOOT button (pin 0): short press = brightness, long press = orientation
+  {
+    static bool          pressing   = false;
+    static unsigned long pressStart = 0;
+    bool p = (digitalRead(BOOT_BTN_PIN) == LOW);
+    if (!pressing && p) { pressing = true; pressStart = millis(); }
+    else if (pressing && !p) {
+      pressing = false;
+      if (millis() - pressStart >= 800) toggleOrientation();
+      else                              cycleBrightness();
+    }
+  }
 }
 
 // ---- Alarm ----
@@ -242,15 +288,18 @@ void checkAlarms() {
 void saveHistoryToNVS() {
   preferences.begin("bghistory", false);
   preferences.putBytes("hist36", readingHistory, sizeof(readingHistory));
+  preferences.putULong("lastTs", timeStampLatestBgReadingInSecondsUTC);
   preferences.end();
 }
 
 void loadHistoryFromNVS() {
   preferences.begin("bghistory", true);
   size_t n = preferences.getBytes("hist36", readingHistory, sizeof(readingHistory));
-  preferences.end();
-  if (n == sizeof(readingHistory))
+  if (n == sizeof(readingHistory)) {
+    timeStampLatestBgReadingInSecondsUTC = preferences.getULong("lastTs", 0);
     Serial.println(F("BG history restored from NVS"));
+  }
+  preferences.end();
 }
 
 void pushReadingToHistory(float mmolValue) {
@@ -381,7 +430,7 @@ void updateGlycemia() {
   strlcpy(sgvStr, "---", sizeof(sgvStr));
   unsigned long utcNow = getUTCTimeInSeconds();
   if (utcNow > 0 && ns.sensSgvMgDl > 0 &&
-      utcNow <= timeStampLatestBgReadingInSecondsUTC + 5*60 + 10) {
+      utcNow <= timeStampLatestBgReadingInSecondsUTC + 7*60) {
     if (cfg.show_mgdl == 1)
       snprintf(sgvStr, sizeof(sgvStr), ns.sensSgvMgDl < 100 ? "%2.0f" : "%3.0f", ns.sensSgvMgDl);
     else
@@ -406,101 +455,173 @@ void updateGlycemia() {
   const uint16_t txtCol = toPanelColor(textColor);
   const uint16_t bgFill = toPanelColor(backGroundColor);
 
-  // Row 0 — current time top-left (font2 × size1, ~14px tall)
   tft.setFreeFont(nullptr);
   tft.setTextFont(2);
   tft.setTextSize(1);
-  tft.setTextColor(txtCol, bgFill);
-  tft.setTextDatum(TL_DATUM);
-  unsigned long localNow = getLocalTimeInSeconds();
-  if (localNow > 0) {
-    char clockStr[6];
-    snprintf(clockStr, sizeof(clockStr), "%02d:%02d",
-             (int)((localNow % 86400UL) / 3600),
-             (int)((localNow % 3600UL)  / 60));
-    tft.drawString(clockStr, 4, 6, 2);
-  }
 
-  // Row 0 — large BG value (font4 × size3 = 78px, y=6..84)
-  tft.setTextFont(4);
-  tft.setTextSize(3);
-  tft.setTextColor(bgCol, bgFill);
-  tft.drawCentreString(sgvStr, 160, 6, 4);
-
-  // Row 0 — trend arrow (base at x=262, y=48; flat tip at ~x=300)
-  if (hasData && ns.arrowAngle != 180)
-    drawArrow(tft, 262, 48, 30, ns.arrowAngle + 85, 30, 40, bgCol);
-
-  // Row 1 — delta | units | time-ago (y=98)
-  tft.setTextFont(2);
-  tft.setTextSize(1);
-  if (deltaStr[0]) {
-    tft.setTextColor(bgCol, bgFill);
-    tft.setTextDatum(ML_DATUM);
-    tft.drawString(deltaStr, 8, 98, 2);
-  }
-  tft.setTextColor(txtCol, bgFill);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString(cfg.show_mgdl == 1 ? "mg/dL" : "mmol/L", W / 2, 98, 2);
-  if (hasData && minSince > 0) {
-    char timeStr[12];
-    snprintf(timeStr, sizeof(timeStr), "%lu min", minSince);
-    uint16_t tc = (minSince >= 10) ? toPanelColor(TFT_YELLOW) : txtCol;
-    tft.setTextColor(tc, bgFill);
-    tft.setTextDatum(MR_DATUM);
-    tft.drawString(timeStr, W - 4, 98, 2);
-  }
-
-  // Row 2 — IoB + CoB (left) + last bolus (right) (y=116, cyan)
+  // Build shared strings used in both layouts
   const bool hasIob   = hasData && ns.iob > 0.05f;
   const bool hasCob   = hasData && ns.cob > 0;
   const bool hasBolus = hasData && ns.lastBolusU > 0.0f && ns.lastBolusAgeMins > 0;
   const bool hasRow2  = hasIob || hasCob || hasBolus;
-  if (hasRow2) {
-    tft.setTextColor(toPanelColor(TFT_CYAN), bgFill);
-    // Build left string: IoB and/or CoB
-    char leftStr[24] = {}, bolStr[16] = {};
-    if (hasIob && hasCob)
-      snprintf(leftStr, sizeof(leftStr), "IoB:%.1fU CoB:%dg", ns.iob, ns.cob);
-    else if (hasIob)
-      snprintf(leftStr, sizeof(leftStr), "IoB:%.1fU", ns.iob);
-    else if (hasCob)
-      snprintf(leftStr, sizeof(leftStr), "CoB:%dg", ns.cob);
-    if (hasBolus) {
-      if (ns.lastBolusAgeMins < 60)
-        snprintf(bolStr, sizeof(bolStr), "%.1fU %dm", ns.lastBolusU, ns.lastBolusAgeMins);
-      else
-        snprintf(bolStr, sizeof(bolStr), "%.1fU %dh", ns.lastBolusU, ns.lastBolusAgeMins / 60);
-    }
-    if (leftStr[0] && bolStr[0]) {
-      tft.setTextDatum(ML_DATUM); tft.drawString(leftStr, 8,     116, 2);
-      tft.setTextDatum(MR_DATUM); tft.drawString(bolStr,  W - 4, 116, 2);
-    } else {
-      tft.setTextDatum(MC_DATUM);
-      tft.drawString(leftStr[0] ? leftStr : bolStr, W / 2, 116, 2);
-    }
-  }
+  const bool hasPump  = hasData && (ns.pumpReservoir > 0.1f || ns.pumpBattery < 255);
 
-  // Row 3 — pump data (y=134, magenta) — only if pump connected
-  const bool hasPump = hasData && (ns.pumpReservoir > 0.1f || ns.pumpBattery < 255);
+  char leftStr[24] = {}, bolStr[16] = {}, resStr[16] = {}, batStr[16] = {};
+  if (hasIob && hasCob)
+    snprintf(leftStr, sizeof(leftStr), "IoB:%.1fU CoB:%dg", ns.iob, ns.cob);
+  else if (hasIob)
+    snprintf(leftStr, sizeof(leftStr), "IoB:%.1fU", ns.iob);
+  else if (hasCob)
+    snprintf(leftStr, sizeof(leftStr), "CoB:%dg", ns.cob);
+  if (hasBolus) {
+    if (ns.lastBolusAgeMins < 60)
+      snprintf(bolStr, sizeof(bolStr), "%.1fU %dm", ns.lastBolusU, ns.lastBolusAgeMins);
+    else
+      snprintf(bolStr, sizeof(bolStr), "%.1fU %dh", ns.lastBolusU, ns.lastBolusAgeMins / 60);
+  }
   if (hasPump) {
-    tft.setTextColor(toPanelColor(TFT_MAGENTA), bgFill);
-    char resStr[16] = {}, batStr[16] = {};
-    if (ns.pumpReservoir > 0.1f)
-      snprintf(resStr, sizeof(resStr), "Res:%.0fu", ns.pumpReservoir);
-    if (ns.pumpBattery < 255)
-      snprintf(batStr, sizeof(batStr), "Bat:%d%%", ns.pumpBattery);
-    if (resStr[0]) { tft.setTextDatum(ML_DATUM); tft.drawString(resStr, 8,     134, 2); }
-    if (batStr[0]) { tft.setTextDatum(MR_DATUM); tft.drawString(batStr, W - 4, 134, 2); }
+    if (ns.pumpReservoir > 0.1f) snprintf(resStr, sizeof(resStr), "Res:%.0fu", ns.pumpReservoir);
+    if (ns.pumpBattery < 255)    snprintf(batStr, sizeof(batStr), "Bat:%d%%",  ns.pumpBattery);
   }
 
-  // Graph
-  const int16_t gx = 12;
-  const int16_t gy = hasPump ? 152 : (hasRow2 ? 132 : 122);
-  const int16_t gw = W - 24;
-  const int16_t gh = H - gy - 8;
-  tft.drawFastHLine(0, gy - 6, W, toPanelColor(TFT_DARKGREY));
-  drawMiniGraph(tft, gx, gy, gw, gh);
+  char clockStr[6] = {};
+  unsigned long localNow = getLocalTimeInSeconds();
+  if (localNow > 0)
+    snprintf(clockStr, sizeof(clockStr), "%02d:%02d",
+             (int)((localNow % 86400UL) / 3600),
+             (int)((localNow % 3600UL)  / 60));
+
+  char timeStr[12] = {};
+  uint16_t timeCol = txtCol;
+  if (hasData && minSince > 0) {
+    snprintf(timeStr, sizeof(timeStr), "%lu min", minSince);
+    timeCol = (minSince >= 10) ? toPanelColor(TFT_YELLOW) : txtCol;
+  }
+
+  if (!isPortrait) {
+    // ---- LANDSCAPE 320×240 ----
+
+    // Row 0 — clock TL
+    tft.setTextColor(txtCol, bgFill);
+    tft.setTextDatum(TL_DATUM);
+    if (clockStr[0]) tft.drawString(clockStr, 4, 6, 2);
+
+    // Row 0 — large BG value centered
+    tft.setTextFont(4);
+    tft.setTextSize(3);
+    tft.setTextColor(bgCol, bgFill);
+    tft.drawCentreString(sgvStr, 160, 6, 4);
+
+    // Row 0 — trend arrow
+    if (hasData && ns.arrowAngle != 180)
+      drawArrow(tft, 262, 48, 30, ns.arrowAngle + 85, 30, 40, bgCol);
+
+    // Row 1 — delta | units | time-ago (y=98)
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    if (deltaStr[0]) {
+      tft.setTextColor(bgCol, bgFill);
+      tft.setTextDatum(ML_DATUM);
+      tft.drawString(deltaStr, 8, 98, 2);
+    }
+    tft.setTextColor(txtCol, bgFill);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(cfg.show_mgdl == 1 ? "mg/dL" : "mmol/L", W / 2, 98, 2);
+    if (timeStr[0]) {
+      tft.setTextColor(timeCol, bgFill);
+      tft.setTextDatum(MR_DATUM);
+      tft.drawString(timeStr, W - 4, 98, 2);
+    }
+
+    // Row 2 — IoB/CoB/bolus (y=116, cyan)
+    if (hasRow2) {
+      tft.setTextColor(toPanelColor(TFT_CYAN), bgFill);
+      if (leftStr[0] && bolStr[0]) {
+        tft.setTextDatum(ML_DATUM); tft.drawString(leftStr, 8,     116, 2);
+        tft.setTextDatum(MR_DATUM); tft.drawString(bolStr,  W - 4, 116, 2);
+      } else {
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(leftStr[0] ? leftStr : bolStr, W / 2, 116, 2);
+      }
+    }
+
+    // Row 3 — pump (y=134, magenta)
+    if (hasPump) {
+      tft.setTextColor(toPanelColor(TFT_MAGENTA), bgFill);
+      if (resStr[0]) { tft.setTextDatum(ML_DATUM); tft.drawString(resStr, 8,     134, 2); }
+      if (batStr[0]) { tft.setTextDatum(MR_DATUM); tft.drawString(batStr, W - 4, 134, 2); }
+    }
+
+    // Graph
+    const int16_t gx = 12;
+    const int16_t gy = hasPump ? 152 : (hasRow2 ? 132 : 122);
+    const int16_t gw = W - 24;
+    const int16_t gh = H - gy - 8;
+    tft.drawFastHLine(0, gy - 6, W, toPanelColor(TFT_DARKGREY));
+    drawMiniGraph(tft, gx, gy, gw, gh);
+
+  } else {
+    // ---- PORTRAIT 240×320 ----
+
+    // Row 0 — clock TL | delta TR (y=6, font2)
+    tft.setTextColor(txtCol, bgFill);
+    tft.setTextDatum(TL_DATUM);
+    if (clockStr[0]) tft.drawString(clockStr, 4, 6, 2);
+    if (deltaStr[0]) {
+      tft.setTextColor(bgCol, bgFill);
+      tft.setTextDatum(TR_DATUM);
+      tft.drawString(deltaStr, W - 4, 6, 2);
+    }
+
+    // Large BG value centered (y=24, font4×3 = ~78px)
+    tft.setTextFont(4);
+    tft.setTextSize(3);
+    tft.setTextColor(bgCol, bgFill);
+    tft.drawCentreString(sgvStr, W / 2, 24, 4);
+
+    // Trend arrow (right side, y=60)
+    if (hasData && ns.arrowAngle != 180)
+      drawArrow(tft, W - 28, 60, 22, ns.arrowAngle + 85, 22, 32, bgCol);
+
+    // Row 1 — units MC | time-ago MR (y=108, font2)
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextColor(txtCol, bgFill);
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString(cfg.show_mgdl == 1 ? "mg/dL" : "mmol/L", 4, 108, 2);
+    if (timeStr[0]) {
+      tft.setTextColor(timeCol, bgFill);
+      tft.setTextDatum(MR_DATUM);
+      tft.drawString(timeStr, W - 4, 108, 2);
+    }
+
+    // Row 2 — IoB/CoB/bolus (y=124, cyan)
+    if (hasRow2) {
+      tft.setTextColor(toPanelColor(TFT_CYAN), bgFill);
+      if (leftStr[0] && bolStr[0]) {
+        tft.setTextDatum(ML_DATUM); tft.drawString(leftStr, 4,     124, 2);
+        tft.setTextDatum(MR_DATUM); tft.drawString(bolStr,  W - 4, 124, 2);
+      } else {
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(leftStr[0] ? leftStr : bolStr, W / 2, 124, 2);
+      }
+    }
+
+    // Row 3 — pump (y=140, magenta)
+    if (hasPump) {
+      tft.setTextColor(toPanelColor(TFT_MAGENTA), bgFill);
+      if (resStr[0]) { tft.setTextDatum(ML_DATUM); tft.drawString(resStr, 4,     140, 2); }
+      if (batStr[0]) { tft.setTextDatum(MR_DATUM); tft.drawString(batStr, W - 4, 140, 2); }
+    }
+
+    // Graph — portrait has more vertical space (~160px)
+    const int16_t gx = 12;
+    const int16_t gy = hasPump ? 164 : (hasRow2 ? 150 : 132);
+    const int16_t gw = W - 24;
+    const int16_t gh = H - gy - 8;
+    tft.drawFastHLine(0, gy - 6, W, toPanelColor(TFT_DARKGREY));
+    drawMiniGraph(tft, gx, gy, gw, gh);
+  }
 }
 
 // ---- WiFi + Nightscout ----
@@ -784,7 +905,7 @@ void setup() {
 
   tft.init();
   tft.invertDisplay(false);
-  tft.setRotation(1);  // landscape
+  tft.setRotation(1);  // landscape default until config loaded
   tft.setTextColor(toPanelColor(textColor), toPanelColor(backGroundColor));
   tft.fillScreen(toPanelColor(backGroundColor));
   tft.setCursor(0, 0);
@@ -810,6 +931,12 @@ void setup() {
   BG_WARN_HIGH = cfg.bg_warn_high;
   BG_HIGH      = cfg.bg_high;
   blLevelIdx   = cfg.brightness;
+
+  // Apply rotation: NVS-saved toggle state, overridden by CYD.INI if explicitly set
+  isPortrait = loadRotationFromNVS();
+  if (cfg.rotation == 0) isPortrait = false;
+  else if (cfg.rotation == 1) isPortrait = true;
+  applyRotation(isPortrait);
 
   Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
   setupWifi();

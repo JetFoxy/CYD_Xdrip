@@ -41,6 +41,11 @@ void readCYDConfig(const char *iniFilename, tConfig *cfg) {
     if (v >= 0 && v <= 2) cfg->brightness = v;
   }
 
+  if (ini.getValue("config", "rotation", buf, bufLen)) {
+    int v = atoi(buf);
+    if (v == 0 || v == 1) cfg->rotation = v;
+  }
+
   if (ini.getValue("config", "ntp_server", buf, bufLen))
     strlcpy(cfg->ntp_server, buf, sizeof(cfg->ntp_server));
 

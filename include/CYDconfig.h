@@ -12,6 +12,7 @@ struct tConfig {
   float bg_warn_high      = 9.0f;  // BG threshold: warning high
   float bg_high           = 10.0f; // BG threshold: urgent high
   int   brightness        = 2;     // initial brightness: 0=dim, 1=mid, 2=bright
+  int   rotation          = -1;    // -1=use NVS/default, 0=landscape, 1=portrait
   char  wifi_ssid[64]     = {0};   // WiFi SSID
   char  wifi_password[64] = {0};   // WiFi password
   char  ns_url[128]       = {0};   // Nightscout URL, e.g. https://mysite.ns.io
