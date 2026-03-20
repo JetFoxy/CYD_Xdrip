@@ -40,7 +40,7 @@ Used in firmware for BG alarms (LEDC channel 1, GPIO 26).
 P3 Pin 1 — GND
 P3 Pin 2 — 3.3V
 P3 Pin 3 — GPIO 22  →  Alarm reset button
-P3 Pin 4 — GPIO 27  →  Brightness cycle button
+P3 Pin 4 — GPIO 27  →  Brightness / orientation button
 ```
 
 **Button wiring:** connect between GPIO pin and GND.
@@ -49,11 +49,17 @@ Internal pull-up enabled in firmware (`INPUT_PULLUP`) — no external resistors 
 **Recommended buttons:** 6×6×5mm tactile switch (momentary, 4-pin DIP).
 For panel mounting: M12 momentary push button with threaded collar.
 
+**GPIO 27 behaviour:**
+- Short press — cycle backlight brightness (dim → medium → bright)
+- Long press (≥ 800 ms) — toggle display orientation (landscape ↔ portrait); saved to NVS
+
 ---
 
 ### BOOT Button (GPIO 0)
 
-On-board button. Also cycles brightness — same function as P3 brightness button.
+On-board button.
+- **Short press** — cycle brightness (same as P3 GPIO 27)
+- **Long press (≥ 800 ms)** — toggle display orientation (landscape ↔ portrait)
 
 ---
 
@@ -80,6 +86,10 @@ bg_high=10.0
 ; Initial brightness level: 0 = dim, 1 = medium, 2 = bright
 brightness=2
 
+; Display orientation: 0 = landscape (default), 1 = portrait.
+; If omitted, the last orientation set by button press (saved in NVS) is used.
+; rotation=0
+
 ; BLE auth password. If omitted, device auto-generates one.
 ; blepassword=mypassword
 
@@ -101,7 +111,7 @@ url=https://mysite.herokuapp.com
 
 | GPIO | Function | Notes |
 |------|----------|-------|
-| 0    | BOOT button (brightness cycle) | Active LOW, internal pull-up |
+| 0    | BOOT button — short: brightness, long: orientation | Active LOW, internal pull-up |
 | 5    | SD card CS | VSPI |
 | 18   | SD card SCK | VSPI |
 | 19   | SD card MISO | VSPI |
@@ -109,7 +119,7 @@ url=https://mysite.herokuapp.com
 | 22   | P3 — alarm reset button | Active LOW, internal pull-up |
 | 23   | SD card MOSI | VSPI |
 | 26   | CN1 speaker | PWM, LEDC ch 1 |
-| 27   | P3 — brightness button | Active LOW, internal pull-up |
+| 27   | P3 — short: brightness, long: orientation | Active LOW, internal pull-up |
 
 ---
 

@@ -88,8 +88,19 @@ static unsigned long lastNsFetchMs = 0;
 static const unsigned long NS_FETCH_INTERVAL_MS = 5UL * 60UL * 1000UL;  // 5 min
 
 // ---- State ----
-static const int historySize = 36;  // 36 × 5 min = 3 hours
-float readingHistory[historySize]  = {0};
+static const int          historySize          = 180;         // 3 h at 1-min resolution
+static const unsigned long BG_HISTORY_WINDOW_SEC = 3UL * 3600UL; // graph time window
+static const unsigned long BG_PREFILL_INTERVAL_SEC = 5UL * 60UL; // assumed CGM interval for 0x21
+static const unsigned long BG_FRESHNESS_SEC      = 7UL * 60UL;  // staleness threshold for display
+static const unsigned long BTN_LONG_PRESS_MS     = 800UL;       // long-press threshold
+static const float         GRAPH_MMOL_MIN        = 2.5f;
+static const float         GRAPH_MMOL_MAX        = 15.0f;
+
+struct BgReading {
+  float         mmol   = 0.0f;
+  unsigned long utcSec = 0;      // UTC timestamp; 0 = unknown
+};
+static BgReading readingHistory[historySize];
 
 unsigned long timeStampLatestBgReadingInSecondsUTC = 0;
 unsigned long msCount                              = 0;
@@ -150,8 +161,8 @@ void     setNsArrowAngle();
 uint16_t toPanelColor(uint16_t color);
 uint16_t bgValueColor(float mmol);
 void     getDeltaStr(char *buf, int bufSize);
-void     pushReadingToHistory(float mmolValue);
-void     drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h);
+void     pushReadingToHistory(float mmolValue, unsigned long utcSec);
+void     drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h, unsigned long now);
 void     drawArrow(TFT_eSPI &surface, int x, int y, int asize, int aangle, int pwidth, int plength, uint16_t color);
 
 // ---- Colour helpers ----
@@ -159,6 +170,8 @@ void     drawArrow(TFT_eSPI &surface, int x, int y, int asize, int aangle, int p
 uint16_t toPanelColor(uint16_t color) {
   return displayColorsInverted ? uint16_t(color ^ 0xFFFF) : color;
 }
+
+static inline float mgdlToMmol(float mg) { return mg / 18.0f; }
 
 uint16_t bgValueColor(float mmol) {
   if (mmol <= 0)           return toPanelColor(textColor);
@@ -198,29 +211,16 @@ static void toggleOrientation() {
 }
 
 void handleBrightnessButton() {
-  // BTN_BRIGHTNESS (pin 27): short press = brightness, long press = orientation
-  {
-    static bool          pressing   = false;
-    static unsigned long pressStart = 0;
-    bool p = (digitalRead(BTN_BRIGHTNESS) == LOW);
-    if (!pressing && p) { pressing = true; pressStart = millis(); }
-    else if (pressing && !p) {
-      pressing = false;
-      if (millis() - pressStart >= 800) toggleOrientation();
-      else                              cycleBrightness();
-    }
-  }
-
-  // BOOT button (pin 0): short press = brightness, long press = orientation
-  {
-    static bool          pressing   = false;
-    static unsigned long pressStart = 0;
-    bool p = (digitalRead(BOOT_BTN_PIN) == LOW);
-    if (!pressing && p) { pressing = true; pressStart = millis(); }
-    else if (pressing && !p) {
-      pressing = false;
-      if (millis() - pressStart >= 800) toggleOrientation();
-      else                              cycleBrightness();
+  static const int pins[]        = {BTN_BRIGHTNESS, BOOT_BTN_PIN};
+  static bool          pressing[2]   = {};
+  static unsigned long pressStart[2] = {};
+  for (int i = 0; i < 2; i++) {
+    bool p = (digitalRead(pins[i]) == LOW);
+    if (!pressing[i] && p) { pressing[i] = true; pressStart[i] = millis(); }
+    else if (pressing[i] && !p) {
+      pressing[i] = false;
+      if (millis() - pressStart[i] >= BTN_LONG_PRESS_MS) toggleOrientation();
+      else                                                cycleBrightness();
     }
   }
 }
@@ -287,14 +287,14 @@ void checkAlarms() {
 
 void saveHistoryToNVS() {
   preferences.begin("bghistory", false);
-  preferences.putBytes("hist36", readingHistory, sizeof(readingHistory));
+  preferences.putBytes("hist", readingHistory, sizeof(readingHistory));
   preferences.putULong("lastTs", timeStampLatestBgReadingInSecondsUTC);
   preferences.end();
 }
 
 void loadHistoryFromNVS() {
   preferences.begin("bghistory", true);
-  size_t n = preferences.getBytes("hist36", readingHistory, sizeof(readingHistory));
+  size_t n = preferences.getBytes("hist", readingHistory, sizeof(readingHistory));
   if (n == sizeof(readingHistory)) {
     timeStampLatestBgReadingInSecondsUTC = preferences.getULong("lastTs", 0);
     Serial.println(F("BG history restored from NVS"));
@@ -302,12 +302,15 @@ void loadHistoryFromNVS() {
   preferences.end();
 }
 
-void pushReadingToHistory(float mmolValue) {
+void pushReadingToHistory(float mmolValue, unsigned long utcSec) {
   if (mmolValue <= 0) return;
+  // Skip duplicate timestamp
+  if (utcSec > 0 && readingHistory[0].utcSec == utcSec) return;
   for (int i = historySize - 1; i > 0; --i)
     readingHistory[i] = readingHistory[i - 1];
-  readingHistory[0] = mmolValue;
-  saveHistoryToNVS();
+  readingHistory[0].mmol   = mmolValue;
+  readingHistory[0].utcSec = utcSec;
+  // NVS write is deferred — main loop flushes every 5 min
 }
 
 // ---- Time helpers ----
@@ -333,8 +336,8 @@ unsigned long getUTCTimeInSeconds() {
 // ---- Delta string ----
 
 void getDeltaStr(char *buf, int bufSize) {
-  if (readingHistory[0] <= 0 || readingHistory[1] <= 0) { buf[0] = '\0'; return; }
-  float d = readingHistory[0] - readingHistory[1];
+  if (readingHistory[0].mmol <= 0 || readingHistory[1].mmol <= 0) { buf[0] = '\0'; return; }
+  float d = readingHistory[0].mmol - readingHistory[1].mmol;
   if (cfg.show_mgdl == 1) {
     int di = (int)(d * 18.0f + (d >= 0 ? 0.5f : -0.5f));
     snprintf(buf, bufSize, di >= 0 ? "+%d" : "%d", di);
@@ -345,10 +348,8 @@ void getDeltaStr(char *buf, int bufSize) {
 
 // ---- Graph ----
 
-void drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h) {
-  const float mmolMin   = 2.5f;
-  const float mmolMax   = 15.0f;
-  const float mmolRange = mmolMax - mmolMin;
+void drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h, unsigned long now) {
+  const float mmolRange = GRAPH_MMOL_MAX - GRAPH_MMOL_MIN;
 
   const uint16_t frameColor  = toPanelColor(TFT_DARKGREY);
   const uint16_t greenColor  = toPanelColor(TFT_GREEN);
@@ -358,30 +359,42 @@ void drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h
 
   surface.drawRoundRect(x - 2, y - 2, w + 4, h + 4, 4, frameColor);
 
-  int16_t yLow  = y + h - (int16_t)((BG_LOW  - mmolMin) / mmolRange * h);
-  int16_t yHigh = y + h - (int16_t)((BG_HIGH - mmolMin) / mmolRange * h);
+  int16_t yLow  = y + h - (int16_t)((BG_LOW  - GRAPH_MMOL_MIN) / mmolRange * h);
+  int16_t yHigh = y + h - (int16_t)((BG_HIGH - GRAPH_MMOL_MIN) / mmolRange * h);
   surface.drawFastHLine(x, yLow,  w, toPanelColor(0x001F));  // dim blue
   surface.drawFastHLine(x, yHigh, w, toPanelColor(0xA000));  // dim red
 
-  int16_t spacing = (w - 10) / (historySize - 1);
-  int16_t dotR    = (spacing >= 8) ? 2 : 1;
-  int16_t prevPx  = -1, prevPy = -1;
+  // Time-based positioning: right = now, left = now - BG_HISTORY_WINDOW_SEC
+  // Fallback (no time sync): evenly space by array index
+  const bool useTime = (now > 0);
 
-  for (int i = 0; i < historySize; i++) {
-    float glk = readingHistory[historySize - 1 - i];  // oldest→left, newest→right
+  int16_t prevPx = -1, prevPy = -1;
+
+  for (int i = historySize - 1; i >= 0; i--) {  // oldest → newest
+    float glk = readingHistory[i].mmol;
     if (glk <= 0) { prevPx = -1; continue; }
-    glk = constrain(glk, mmolMin, mmolMax);
+    glk = constrain(glk, GRAPH_MMOL_MIN, GRAPH_MMOL_MAX);
+
+    int16_t px;
+    if (useTime) {
+      if (readingHistory[i].utcSec == 0) { prevPx = -1; continue; }
+      long age = (long)now - (long)readingHistory[i].utcSec;
+      if (age < 0 || age > (long)BG_HISTORY_WINDOW_SEC) { prevPx = -1; continue; }
+      px = x + 5 + (int16_t)((1.0f - (float)age / BG_HISTORY_WINDOW_SEC) * (w - 10));
+    } else {
+      // No time sync: spread by array index (oldest at left, newest at right)
+      px = x + 5 + (int16_t)((float)(historySize - 1 - i) / (historySize - 1) * (w - 10));
+    }
 
     uint16_t pc = greenColor;
     if      (glk < BG_LOW)       pc = blueColor;
     else if (glk < BG_WARN_LOW)  pc = yellowColor;
     else if (glk > BG_HIGH)      pc = redColor;
     else if (glk > BG_WARN_HIGH) pc = yellowColor;
-
-    int16_t px = x + 5 + i * spacing;
-    int16_t py = y + h - (int16_t)((glk - mmolMin) / mmolRange * h);
+    int16_t py = y + h - (int16_t)((glk - GRAPH_MMOL_MIN) / mmolRange * h);
 
     if (prevPx >= 0) surface.drawLine(prevPx, prevPy, px, py, frameColor);
+    int16_t dotR = (prevPx >= 0 && px - prevPx >= 8) ? 2 : 1;
     surface.fillCircle(px, py, dotR, pc);
     prevPx = px; prevPy = py;
   }
@@ -430,7 +443,7 @@ void updateGlycemia() {
   strlcpy(sgvStr, "---", sizeof(sgvStr));
   unsigned long utcNow = getUTCTimeInSeconds();
   if (utcNow > 0 && ns.sensSgvMgDl > 0 &&
-      utcNow <= timeStampLatestBgReadingInSecondsUTC + 7*60) {
+      utcNow <= timeStampLatestBgReadingInSecondsUTC + BG_FRESHNESS_SEC) {
     if (cfg.show_mgdl == 1)
       snprintf(sgvStr, sizeof(sgvStr), ns.sensSgvMgDl < 100 ? "%2.0f" : "%3.0f", ns.sensSgvMgDl);
     else
@@ -498,130 +511,89 @@ void updateGlycemia() {
     timeCol = (minSince >= 10) ? toPanelColor(TFT_YELLOW) : txtCol;
   }
 
-  if (!isPortrait) {
-    // ---- LANDSCAPE 320×240 ----
+  // Layout parameters (portrait vs landscape)
+  const int16_t margin = isPortrait ? 4   : 8;
+  const int16_t row1Y  = isPortrait ? 108 : 98;
+  const int16_t row2Y  = isPortrait ? 124 : 116;
+  const int16_t row3Y  = isPortrait ? 140 : 134;
+  const int16_t gyPump = isPortrait ? 164 : 152;
+  const int16_t gyR2   = isPortrait ? 150 : 132;
+  const int16_t gyNone = isPortrait ? 132 : 122;
 
-    // Row 0 — clock TL
-    tft.setTextColor(txtCol, bgFill);
-    tft.setTextDatum(TL_DATUM);
-    if (clockStr[0]) tft.drawString(clockStr, 4, 6, 2);
+  // Row 0 — clock (both modes)
+  tft.setTextColor(txtCol, bgFill);
+  tft.setTextDatum(TL_DATUM);
+  if (clockStr[0]) tft.drawString(clockStr, 4, 6, 2);
 
-    // Row 0 — large BG value centered
-    tft.setTextFont(4);
-    tft.setTextSize(3);
-    tft.setTextColor(bgCol, bgFill);
-    tft.drawCentreString(sgvStr, 160, 6, 4);
-
-    // Row 0 — trend arrow
-    if (hasData && ns.arrowAngle != 180)
-      drawArrow(tft, 262, 48, 30, ns.arrowAngle + 85, 30, 40, bgCol);
-
-    // Row 1 — delta | units | time-ago (y=98)
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    if (deltaStr[0]) {
-      tft.setTextColor(bgCol, bgFill);
-      tft.setTextDatum(ML_DATUM);
-      tft.drawString(deltaStr, 8, 98, 2);
-    }
-    tft.setTextColor(txtCol, bgFill);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(cfg.show_mgdl == 1 ? "mg/dL" : "mmol/L", W / 2, 98, 2);
-    if (timeStr[0]) {
-      tft.setTextColor(timeCol, bgFill);
-      tft.setTextDatum(MR_DATUM);
-      tft.drawString(timeStr, W - 4, 98, 2);
-    }
-
-    // Row 2 — IoB/CoB/bolus (y=116, cyan)
-    if (hasRow2) {
-      tft.setTextColor(toPanelColor(TFT_CYAN), bgFill);
-      if (leftStr[0] && bolStr[0]) {
-        tft.setTextDatum(ML_DATUM); tft.drawString(leftStr, 8,     116, 2);
-        tft.setTextDatum(MR_DATUM); tft.drawString(bolStr,  W - 4, 116, 2);
-      } else {
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString(leftStr[0] ? leftStr : bolStr, W / 2, 116, 2);
-      }
-    }
-
-    // Row 3 — pump (y=134, magenta)
-    if (hasPump) {
-      tft.setTextColor(toPanelColor(TFT_MAGENTA), bgFill);
-      if (resStr[0]) { tft.setTextDatum(ML_DATUM); tft.drawString(resStr, 8,     134, 2); }
-      if (batStr[0]) { tft.setTextDatum(MR_DATUM); tft.drawString(batStr, W - 4, 134, 2); }
-    }
-
-    // Graph
-    const int16_t gx = 12;
-    const int16_t gy = hasPump ? 152 : (hasRow2 ? 132 : 122);
-    const int16_t gw = W - 24;
-    const int16_t gh = H - gy - 8;
-    tft.drawFastHLine(0, gy - 6, W, toPanelColor(TFT_DARKGREY));
-    drawMiniGraph(tft, gx, gy, gw, gh);
-
-  } else {
-    // ---- PORTRAIT 240×320 ----
-
-    // Row 0 — clock TL | delta TR (y=6, font2)
-    tft.setTextColor(txtCol, bgFill);
-    tft.setTextDatum(TL_DATUM);
-    if (clockStr[0]) tft.drawString(clockStr, 4, 6, 2);
+  if (isPortrait) {
+    // Portrait Row 0: delta TR, BG centered at y=24, arrow right
     if (deltaStr[0]) {
       tft.setTextColor(bgCol, bgFill);
       tft.setTextDatum(TR_DATUM);
       tft.drawString(deltaStr, W - 4, 6, 2);
     }
-
-    // Large BG value centered (y=24, font4×3 = ~78px)
-    tft.setTextFont(4);
-    tft.setTextSize(3);
+    tft.setTextFont(4); tft.setTextSize(3);
     tft.setTextColor(bgCol, bgFill);
     tft.drawCentreString(sgvStr, W / 2, 24, 4);
-
-    // Trend arrow (right side, y=60)
     if (hasData && ns.arrowAngle != 180)
       drawArrow(tft, W - 28, 60, 22, ns.arrowAngle + 85, 22, 32, bgCol);
-
-    // Row 1 — units MC | time-ago MR (y=108, font2)
-    tft.setTextFont(2);
-    tft.setTextSize(1);
+    // Row 1: units ML
+    tft.setTextFont(2); tft.setTextSize(1);
     tft.setTextColor(txtCol, bgFill);
     tft.setTextDatum(ML_DATUM);
-    tft.drawString(cfg.show_mgdl == 1 ? "mg/dL" : "mmol/L", 4, 108, 2);
-    if (timeStr[0]) {
-      tft.setTextColor(timeCol, bgFill);
-      tft.setTextDatum(MR_DATUM);
-      tft.drawString(timeStr, W - 4, 108, 2);
+    tft.drawString(cfg.show_mgdl == 1 ? "mg/dL" : "mmol/L", margin, row1Y, 2);
+  } else {
+    // Landscape Row 0: BG centered at 160, arrow right
+    tft.setTextFont(4); tft.setTextSize(3);
+    tft.setTextColor(bgCol, bgFill);
+    tft.drawCentreString(sgvStr, 160, 6, 4);
+    if (hasData && ns.arrowAngle != 180)
+      drawArrow(tft, 262, 48, 30, ns.arrowAngle + 85, 30, 40, bgCol);
+    // Row 1: delta ML, units MC
+    tft.setTextFont(2); tft.setTextSize(1);
+    if (deltaStr[0]) {
+      tft.setTextColor(bgCol, bgFill);
+      tft.setTextDatum(ML_DATUM);
+      tft.drawString(deltaStr, margin, row1Y, 2);
     }
-
-    // Row 2 — IoB/CoB/bolus (y=124, cyan)
-    if (hasRow2) {
-      tft.setTextColor(toPanelColor(TFT_CYAN), bgFill);
-      if (leftStr[0] && bolStr[0]) {
-        tft.setTextDatum(ML_DATUM); tft.drawString(leftStr, 4,     124, 2);
-        tft.setTextDatum(MR_DATUM); tft.drawString(bolStr,  W - 4, 124, 2);
-      } else {
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString(leftStr[0] ? leftStr : bolStr, W / 2, 124, 2);
-      }
-    }
-
-    // Row 3 — pump (y=140, magenta)
-    if (hasPump) {
-      tft.setTextColor(toPanelColor(TFT_MAGENTA), bgFill);
-      if (resStr[0]) { tft.setTextDatum(ML_DATUM); tft.drawString(resStr, 4,     140, 2); }
-      if (batStr[0]) { tft.setTextDatum(MR_DATUM); tft.drawString(batStr, W - 4, 140, 2); }
-    }
-
-    // Graph — portrait has more vertical space (~160px)
-    const int16_t gx = 12;
-    const int16_t gy = hasPump ? 164 : (hasRow2 ? 150 : 132);
-    const int16_t gw = W - 24;
-    const int16_t gh = H - gy - 8;
-    tft.drawFastHLine(0, gy - 6, W, toPanelColor(TFT_DARKGREY));
-    drawMiniGraph(tft, gx, gy, gw, gh);
+    tft.setTextColor(txtCol, bgFill);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(cfg.show_mgdl == 1 ? "mg/dL" : "mmol/L", W / 2, row1Y, 2);
   }
+
+  // Row 1 — time-ago MR (shared)
+  if (timeStr[0]) {
+    tft.setTextColor(timeCol, bgFill);
+    tft.setTextDatum(MR_DATUM);
+    tft.drawString(timeStr, W - 4, row1Y, 2);
+  }
+
+  // Row 2 — IoB/CoB/bolus (shared)
+  if (hasRow2) {
+    tft.setTextColor(toPanelColor(TFT_CYAN), bgFill);
+    if (leftStr[0] && bolStr[0]) {
+      tft.setTextDatum(ML_DATUM); tft.drawString(leftStr, margin, row2Y, 2);
+      tft.setTextDatum(MR_DATUM); tft.drawString(bolStr,  W - 4,  row2Y, 2);
+    } else {
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString(leftStr[0] ? leftStr : bolStr, W / 2, row2Y, 2);
+    }
+  }
+
+  // Row 3 — pump (shared)
+  if (hasPump) {
+    tft.setTextColor(toPanelColor(TFT_MAGENTA), bgFill);
+    if (resStr[0]) { tft.setTextDatum(ML_DATUM); tft.drawString(resStr, margin, row3Y, 2); }
+    if (batStr[0]) { tft.setTextDatum(MR_DATUM); tft.drawString(batStr, W - 4,  row3Y, 2); }
+  }
+
+  // Graph (shared)
+  const int16_t gx = 12;
+  const int16_t gy = hasPump ? gyPump : (hasRow2 ? gyR2 : gyNone);
+  const int16_t gw = W - 24;
+  const int16_t gh = H - gy - 8;
+  tft.drawFastHLine(0, gy - 6, W, toPanelColor(TFT_DARKGREY));
+  drawMiniGraph(tft, gx, gy, gw, gh, utcNow);
 }
 
 // ---- WiFi + Nightscout ----
@@ -696,7 +668,7 @@ void fetchNightscout() {
   if (sgvMgDl <= 0) return;
 
   ns.sensSgvMgDl = sgvMgDl;
-  ns.sensSgv     = sgvMgDl / 18.0f;
+  ns.sensSgv     = mgdlToMmol(sgvMgDl);
   timeStampLatestBgReadingInSecondsUTC = (unsigned long)(dateMs / 1000ULL);
   strlcpy(ns.sensDir, dir, sizeof(ns.sensDir));
   setNsArrowAngle();
@@ -705,8 +677,10 @@ void fetchNightscout() {
   int count = (int)arr.size();
   if (count > historySize) count = historySize;
   for (int i = 0; i < count; i++) {
-    float v = arr[i]["sgv"] | 0.0f;
-    readingHistory[i] = (v > 0) ? v / 18.0f : 0.0f;
+    float    v   = arr[i]["sgv"] | 0.0f;
+    uint64_t dMs = arr[i]["date"] | (uint64_t)0;
+    readingHistory[i].mmol   = (v > 0) ? mgdlToMmol(v) : 0.0f;
+    readingHistory[i].utcSec = (unsigned long)(dMs / 1000ULL);
   }
   saveHistoryToNVS();
 
@@ -791,13 +765,16 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
         else    { bleNotify(0x0C); bleAuthenticated = false; }
       } break;
 
-      case 0x21: {  // BG history pre-fill
+      case 0x21: {  // BG history pre-fill (newest first, no timestamps in packet)
         uint8_t count = rxBuf[1];
         if (count > historySize) count = historySize;
         if (!bleAuthenticated || rxLen < 3 + count * 2) break;
+        // Estimate timestamps: assume 5-min intervals from last known reading
+        unsigned long baseTs = timeStampLatestBgReadingInSecondsUTC;
         for (uint8_t i = 0; i < count; i++) {
           uint16_t mg = (uint16_t(rxBuf[3 + i*2]) << 8) | rxBuf[4 + i*2];
-          readingHistory[i] = mg / 18.0f;
+          readingHistory[i].mmol   = (mg > 0) ? mgdlToMmol(mg) : 0.0f;
+          readingHistory[i].utcSec = (baseTs > 0) ? baseTs - (unsigned long)i * BG_PREFILL_INTERVAL_SEC : 0;
         }
         Serial.printf("History preloaded: %u points\n", count);
       } break;
@@ -825,7 +802,7 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
 
         cfg.show_mgdl   = isMgdl ? 1 : 0;
         ns.sensSgvMgDl  = float(bgMgdl);
-        ns.sensSgv      = bgMgdl / 18.0f;
+        ns.sensSgv      = mgdlToMmol(bgMgdl);
         ns.sensTime     = time_t(ts);
         timeStampLatestBgReadingInSecondsUTC = ts;
 
@@ -861,7 +838,7 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
         // CoB (byte 25)
         ns.cob = (rxLen >= 26) ? rxBuf[25] : 0;
 
-        if (!isStale) pushReadingToHistory(ns.sensSgv);
+        if (!isStale) pushReadingToHistory(ns.sensSgv, ts);
         bleDataReady = true;  // signal main loop to redraw (avoids concurrent TFT access)
       } break;
     }
@@ -970,5 +947,12 @@ void loop() {
     bleDataReady = false;
     updateGlycemia();
     msCount = millis();
+  }
+
+  // Flush history to NVS at most once per 5 min (avoids flash wear on every BLE reading)
+  static unsigned long lastHistorySaveMs = 0;
+  if (millis() - lastHistorySaveMs >= NS_FETCH_INTERVAL_MS) {
+    saveHistoryToNVS();
+    lastHistorySaveMs = millis();
   }
 }
