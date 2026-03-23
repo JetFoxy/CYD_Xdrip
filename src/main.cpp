@@ -74,8 +74,7 @@ static float BG_WARN_HIGH = 9.0f;
 static float BG_HIGH      = 10.0f;
 
 // ---- BLE constants ----
-// Device name stays "M5Stack" for WatchDrip compatibility
-static const char* BLE_DEVICE_NAME       = "M5Stack";
+static const char* BLE_DEVICE_NAME       = "CYDDrip";
 static const char* BLE_SERVICE_UUID      = "AF6E5F78-706A-43FB-B1F4-C27D7D5C762F";
 static const char* BLE_CHAR_UUID         = "6D810E9F-0983-4030-BDA7-C7C9A6A19C1C";
 static const int   BLE_TX_MAX_BYTES      = 20;   // max notification payload
@@ -838,7 +837,15 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
         // CoB (byte 25)
         ns.cob = (rxLen >= 26) ? rxBuf[25] : 0;
 
-        if (!isStale) pushReadingToHistory(ns.sensSgv, ts);
+        if (!isStale) {
+          pushReadingToHistory(ns.sensSgv, ts);
+          // Retroactively assign timestamps to pre-fill readings (0x21) that arrived
+          // before this 0x20 packet and therefore have utcSec == 0.
+          for (int i = 1; i < historySize; i++) {
+            if (readingHistory[i].mmol > 0 && readingHistory[i].utcSec == 0)
+              readingHistory[i].utcSec = ts - (unsigned long)i * BG_PREFILL_INTERVAL_SEC;
+          }
+        }
         bleDataReady = true;  // signal main loop to redraw (avoids concurrent TFT access)
       } break;
     }
