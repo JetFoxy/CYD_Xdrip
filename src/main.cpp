@@ -37,6 +37,7 @@
 
 // WiFi + Nightscout
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
@@ -81,10 +82,13 @@ static const int   BLE_TX_MAX_BYTES      = 20;   // max notification payload
 static const int   BLE_RX_MAX_BYTES      = 128;  // max write payload (0x21 = 3+35×2=73 bytes)
 
 // ---- WiFi state ----
-static bool          wifiEnabled   = false;
-static bool          ntpSynced     = false;
-static unsigned long lastNsFetchMs = 0;
-static const unsigned long NS_FETCH_INTERVAL_MS = 5UL * 60UL * 1000UL;  // 5 min
+static bool          wifiEnabled        = false;
+static bool          ntpSynced          = false;
+static unsigned long lastNsFetchMs      = 0;
+static unsigned long lastWifiReconnectMs = 0;
+static int           wifiDisconnects    = 0;   // total disconnect events
+static const unsigned long NS_FETCH_INTERVAL_MS    = 5UL * 60UL * 1000UL;  // 5 min
+static const unsigned long WIFI_RECONNECT_INTERVAL = 30UL * 1000UL;        // 30 sec
 
 // ---- State ----
 static const int          historySize          = 180;         // 3 h at 1-min resolution
@@ -598,6 +602,19 @@ void updateGlycemia() {
 // ---- WiFi + Nightscout ----
 
 void setupWifi() {
+  // WiFi event callbacks for disconnect/reconnect logging
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    wifiDisconnects++;
+    Serial.printf("[WiFi] Disconnected #%d, reason: %d\n",
+                  wifiDisconnects, info.wifi_sta_disconnected.reason);
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    Serial.printf("[WiFi] Reconnected — IP: %s, RSSI: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    lastNsFetchMs = 0;  // trigger immediate Nightscout fetch
+  }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+
   // Always start configuration AP so the web interface is reachable at 192.168.4.1
   WiFi.mode(cfg.wifi_ssid[0] ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP("CYDrip-Setup");
@@ -627,24 +644,70 @@ void setupWifi() {
   }
 }
 
+// Temporarily deinit BLE to free ~89 KB for the SSL handshake.
+// Called only when heap is too fragmented for HTTPS with BLE running.
+static void blePause() {
+  Serial.printf("[BLE] Pausing for HTTPS. heap: %u  largest: %u\n",
+                ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  // Stop advertising first so clients disconnect cleanly
+  if (pServer) pServer->getAdvertising()->stop();
+  delay(100);
+  BLEDevice::deinit(true);
+  pServer             = nullptr;
+  pRxTxCharacteristic = nullptr;
+  bleAuthenticated    = false;
+  delay(200);  // let Bluedroid stack fully unwind before any heap use
+  Serial.printf("[BLE] Paused.  heap: %u  largest: %u\n",
+                ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
+
+static void bleResume() {
+  Serial.println(F("[BLE] Resuming after fetch..."));
+  delay(100);
+  setupBLE();
+  Serial.printf("[BLE] Resumed. heap: %u\n", ESP.getFreeHeap());
+}
+
 void fetchNightscout() {
   if (!wifiEnabled || cfg.ns_url[0] == '\0') return;
   if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
+    Serial.println(F("[WiFi] fetchNightscout: not connected, skipping"));
     return;
   }
 
+  // Update immediately — prevents busy-loop retries when all error paths return early
+  lastNsFetchMs = millis();
+
+  uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  bool isHttps = (strncmp(cfg.ns_url, "https://", 8) == 0);
+  Serial.printf("[NS] Fetching... RSSI: %d dBm  heap: %u  largest: %u\n",
+                WiFi.RSSI(), ESP.getFreeHeap(), largestBlock);
+
+  // SSL handshake needs ~32 KB contiguous. Pause BLE (~89 KB) if heap is tight.
+  bool pausedBle = (isHttps && pServer != nullptr && largestBlock < 40000);
+  if (pausedBle) blePause();
+
   // Fetch last 36 entries (3 hours of 5-min readings)
-  String url = String(cfg.ns_url) + "/api/v1/entries.json?count=36&fields=sgv,date,direction";
+  String base = cfg.ns_url;
+  if (base.endsWith("/")) base.remove(base.length() - 1);
+  String url = base + "/api/v1/entries.json?count=36&fields=sgv,date,direction";
   if (cfg.ns_token[0]) { url += "&token="; url += cfg.ns_token; }
+  Serial.printf("[NS] host: %s\n", base.c_str());
 
   HTTPClient http;
-  http.begin(url);
+  WiFiClientSecure secureClient;
+  if (isHttps) {
+    secureClient.setInsecure();  // no CA bundle on ESP32 — skip cert validation
+    http.begin(secureClient, url);
+  } else {
+    http.begin(url);
+  }
   http.setTimeout(8000);
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("Nightscout HTTP %d\n", code);
+    Serial.printf("[NS] HTTP %d\n", code);
     http.end();
+    if (pausedBle) bleResume();
     return;
   }
 
@@ -652,9 +715,12 @@ void fetchNightscout() {
   DeserializationError err = deserializeJson(doc, http.getStream());
   http.end();
   if (err || !doc.is<JsonArray>() || doc.as<JsonArray>().size() == 0) {
-    Serial.printf("Nightscout JSON error: %s\n", err.c_str());
+    Serial.printf("[NS] JSON error: %s\n", err.c_str());
+    if (pausedBle) bleResume();
     return;
   }
+
+  if (pausedBle) bleResume();
 
   JsonArray arr = doc.as<JsonArray>();
 
@@ -683,9 +749,9 @@ void fetchNightscout() {
   }
   saveHistoryToNVS();
 
-  Serial.printf("Nightscout: %.1f mmol/L %s\n", ns.sensSgv, ns.sensDir);
+  Serial.printf("[NS] OK: %.1f mmol/L %s (disconnects total: %d)\n",
+                ns.sensSgv, ns.sensDir, wifiDisconnects);
   updateGlycemia();
-  lastNsFetchMs = millis();
 }
 
 // ---- BLE send helpers ----
@@ -924,10 +990,21 @@ void setup() {
 
   Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
   setupWifi();
+  // First NS fetch BEFORE BLE init: heap is unfragmented, SSL allocation succeeds
+  Serial.printf("Pre-BLE heap: free=%u  largest=%u\n",
+                ESP.getFreeHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  fetchNightscout();
+  Serial.printf("Post-fetch heap: free=%u  largest=%u\n",
+                ESP.getFreeHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   webConfigBegin(cfg, tft, displayColorsInverted);
   tft.println(F("Config: 192.168.4.1"));
   tft.println(F("Waiting for CYDDrip..."));
   setupBLE();
+  Serial.printf("Post-BLE heap: free=%u  largest=%u\n",
+                ESP.getFreeHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
 // ---- Main loop ----
@@ -937,6 +1014,15 @@ void loop() {
   handleBrightnessButton();
   handleAlarmButton();
   checkAlarms();
+  // WiFi reconnect watchdog: retry every 30 s if connection lost
+  if (wifiEnabled && WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWifiReconnectMs >= WIFI_RECONNECT_INTERVAL) {
+      lastWifiReconnectMs = millis();
+      Serial.printf("[WiFi] Not connected, reconnecting... (disconnects: %d)\n", wifiDisconnects);
+      WiFi.reconnect();
+    }
+  }
+
   if (wifiEnabled && millis() - lastNsFetchMs >= NS_FETCH_INTERVAL_MS)
     fetchNightscout();
   delay(20);
