@@ -35,16 +35,18 @@ static inline uint16_t pc(uint16_t c) {
 bool loadCYDConfigFromNVS(tConfig &cfg) {
   Preferences p;
   if (!p.begin(NVS_NS, true)) return false;
-  bool found = p.isKey("wifi_ssid");
-  if (found) {
-    String v;
-    v = p.getString("wifi_ssid",  ""); strlcpy(cfg.wifi_ssid,     v.c_str(), sizeof(cfg.wifi_ssid));
-    v = p.getString("wifi_pass",  ""); strlcpy(cfg.wifi_password,  v.c_str(), sizeof(cfg.wifi_password));
-    v = p.getString("ns_url",     ""); strlcpy(cfg.ns_url,         v.c_str(), sizeof(cfg.ns_url));
-    v = p.getString("ns_token",   ""); strlcpy(cfg.ns_token,       v.c_str(), sizeof(cfg.ns_token));
-    v = p.getString("ntp_server", ""); strlcpy(cfg.ntp_server,     v.c_str(), sizeof(cfg.ntp_server));
-    Serial.println(F("Config loaded from NVS"));
-  }
+  // Use the current struct value as the default for each key, so a key that was
+  // never stored leaves the compiled-in default (or an SD value, if SD is read
+  // first) untouched instead of clobbering it with an empty string.
+  String v;
+  v = p.getString("wifi_ssid",   cfg.wifi_ssid);    strlcpy(cfg.wifi_ssid,     v.c_str(), sizeof(cfg.wifi_ssid));
+  v = p.getString("wifi_pass",   cfg.wifi_password); strlcpy(cfg.wifi_password, v.c_str(), sizeof(cfg.wifi_password));
+  v = p.getString("ns_url",      cfg.ns_url);        strlcpy(cfg.ns_url,        v.c_str(), sizeof(cfg.ns_url));
+  v = p.getString("ns_token",    cfg.ns_token);      strlcpy(cfg.ns_token,      v.c_str(), sizeof(cfg.ns_token));
+  v = p.getString("ntp_server",  cfg.ntp_server);    strlcpy(cfg.ntp_server,    v.c_str(), sizeof(cfg.ntp_server));
+  v = p.getString("blepassword", cfg.blepassword);   strlcpy(cfg.blepassword,   v.c_str(), sizeof(cfg.blepassword));
+  bool found = p.isKey("wifi_ssid") || p.isKey("blepassword");
+  if (found) Serial.println(F("Config loaded from NVS"));
   p.end();
   return found;
 }
@@ -52,11 +54,12 @@ bool loadCYDConfigFromNVS(tConfig &cfg) {
 void saveCYDConfigToNVS(const tConfig &cfg) {
   Preferences p;
   p.begin(NVS_NS, false);
-  p.putString("wifi_ssid",  cfg.wifi_ssid);
-  p.putString("wifi_pass",  cfg.wifi_password);
-  p.putString("ns_url",     cfg.ns_url);
-  p.putString("ns_token",   cfg.ns_token);
-  p.putString("ntp_server", cfg.ntp_server);
+  p.putString("wifi_ssid",   cfg.wifi_ssid);
+  p.putString("wifi_pass",   cfg.wifi_password);
+  p.putString("ns_url",      cfg.ns_url);
+  p.putString("ns_token",    cfg.ns_token);
+  p.putString("ntp_server",  cfg.ntp_server);
+  p.putString("blepassword", cfg.blepassword);  // persist so BLE pairing survives reboot
   p.end();
   Serial.println(F("Config saved to NVS"));
 }
@@ -216,10 +219,16 @@ void webConfigHandle() {
   if (s_apActive && millis() - s_apStartMs >= AP_TIMEOUT_MS) {
     s_apActive = false;
     WiFi.softAPdisconnect(true);
-    if (WiFi.status() == WL_CONNECTED) {
+    if (s_cfg->wifi_ssid[0] != '\0') {
+      // SSID configured → keep STA alive (whether connected or still retrying)
+      // and keep the web server up so config stays reachable at the device IP.
+      // The main loop's watchdog keeps retrying the STA connection.
       WiFi.mode(WIFI_STA);
-      Serial.printf("Config AP closed — web server still on http://%s\n",
-                    WiFi.localIP().toString().c_str());
+      if (WiFi.status() == WL_CONNECTED)
+        Serial.printf("Config AP closed — web server still on http://%s\n",
+                      WiFi.localIP().toString().c_str());
+      else
+        Serial.println(F("Config AP closed — STA retrying, web config stays on"));
     } else {
       s_srv.stop();
       WiFi.mode(WIFI_OFF);

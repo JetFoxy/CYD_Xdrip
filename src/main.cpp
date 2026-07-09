@@ -85,6 +85,7 @@ static const int   BLE_RX_MAX_BYTES      = 128;  // max write payload (0x21 = 3+
 static bool          wifiEnabled        = false;
 static bool          ntpSynced          = false;
 static unsigned long lastNsFetchMs      = 0;
+static volatile bool forceNsFetch       = true;   // fetch once as soon as WiFi connects
 static unsigned long lastWifiReconnectMs = 0;
 static int           wifiDisconnects    = 0;   // total disconnect events
 static const unsigned long NS_FETCH_INTERVAL_MS    = 5UL * 60UL * 1000UL;  // 5 min
@@ -351,7 +352,47 @@ void getDeltaStr(char *buf, int bufSize) {
 
 // ---- Graph ----
 
+// Draw a single decimal digit (0-9) as a 5×7 7-segment glyph using ONLY
+// drawFastHLine / drawFastVLine.  These primitives are confirmed not to cause
+// white-flash on this ILI9341 clone; drawChar/drawPixel do (unknown reason).
+//
+// Segment layout (5 wide × 7 tall):
+//   a = top    HLine (x+1, y,   len 3)
+//   b = TR     VLine (x+4, y+1, len 2)
+//   c = BR     VLine (x+4, y+4, len 2)
+//   d = bottom HLine (x+1, y+6, len 3)
+//   e = BL     VLine (x,   y+4, len 2)
+//   f = TL     VLine (x,   y+1, len 2)
+//   g = middle HLine (x+1, y+3, len 3)
+//
+// Bit encoding: bit0=a, bit1=b, bit2=c, bit3=d, bit4=e, bit5=f, bit6=g
+static const uint8_t SEG7[10] = {
+  0x3F, // 0  a,b,c,d,e,f
+  0x06, // 1  b,c
+  0x5B, // 2  a,b,d,e,g
+  0x4F, // 3  a,b,c,d,g
+  0x66, // 4  b,c,f,g
+  0x6D, // 5  a,c,d,f,g
+  0x7D, // 6  a,c,d,e,f,g
+  0x07, // 7  a,b,c
+  0x7F, // 8  all
+  0x6F, // 9  a,b,c,d,f,g
+};
+
+static void drawTinyDigit(TFT_eSPI &s, int16_t x, int16_t y, uint8_t d, uint16_t color) {
+  uint8_t seg = SEG7[d];
+  if (seg & 0x01) s.drawFastHLine(x+1, y,   3, color); // a top
+  if (seg & 0x02) s.drawFastVLine(x+4, y+1,  2, color); // b TR
+  if (seg & 0x04) s.drawFastVLine(x+4, y+4,  2, color); // c BR
+  if (seg & 0x08) s.drawFastHLine(x+1, y+6,  3, color); // d bottom
+  if (seg & 0x10) s.drawFastVLine(x,   y+4,  2, color); // e BL
+  if (seg & 0x20) s.drawFastVLine(x,   y+1,  2, color); // f TL
+  if (seg & 0x40) s.drawFastHLine(x+1, y+3,  3, color); // g middle
+}
+
 void drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h, unsigned long now) {
+  surface.startWrite();
+
   const float mmolRange = GRAPH_MMOL_MAX - GRAPH_MMOL_MIN;
 
   const uint16_t frameColor  = toPanelColor(TFT_DARKGREY);
@@ -359,17 +400,49 @@ void drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h
   const uint16_t yellowColor = toPanelColor(TFT_YELLOW);
   const uint16_t redColor    = toPanelColor(COLOR_BG_HIGH);
   const uint16_t blueColor   = toPanelColor(COLOR_BG_LOW);
-
-  surface.drawRoundRect(x - 2, y - 2, w + 4, h + 4, 4, frameColor);
-
-  int16_t yLow  = y + h - (int16_t)((BG_LOW  - GRAPH_MMOL_MIN) / mmolRange * h);
-  int16_t yHigh = y + h - (int16_t)((BG_HIGH - GRAPH_MMOL_MIN) / mmolRange * h);
-  surface.drawFastHLine(x, yLow,  w, toPanelColor(0x001F));  // dim blue
-  surface.drawFastHLine(x, yHigh, w, toPanelColor(0xA000));  // dim red
+  const uint16_t gridColor   = toPanelColor(0x4208);  // subtle dark grey
 
   // Time-based positioning: right = now, left = now - BG_HISTORY_WINDOW_SEC
   // Fallback (no time sync): evenly space by array index
   const bool useTime = (now > 0);
+
+  surface.drawRoundRect(x - 2, y - 2, w + 4, h + 4, 4, frameColor);
+
+  // ---- Coordinate grid ----
+  // Horizontal lines + labels at 4, 6, 8, 10, 12 mmol/L.
+  // Labels use drawTinyDigit (drawFastHLine/VLine only) — drawChar/drawPixel cause
+  // white-flash on this ILI9341 clone even inside startWrite()/endWrite().
+  {
+    static const float hGrid[] = {4.0f, 6.0f, 8.0f, 10.0f, 12.0f};
+    const uint16_t lblColor = toPanelColor(TFT_DARKGREY);
+    for (float gv : hGrid) {
+      if (gv <= GRAPH_MMOL_MIN || gv >= GRAPH_MMOL_MAX) continue;
+      int16_t gridY = y + h - (int16_t)((gv - GRAPH_MMOL_MIN) / mmolRange * h);
+      surface.drawFastHLine(x, gridY, w, gridColor);
+      // Draw label digits (5×7 each, 6px advance) above the grid line
+      char lbl[4]; snprintf(lbl, sizeof(lbl), "%d", (int)gv);
+      int16_t lx = x + 1;
+      for (int ci = 0; lbl[ci]; ci++, lx += 6)
+        if (lbl[ci] >= '0' && lbl[ci] <= '9')
+          drawTinyDigit(surface, lx, gridY - 8, lbl[ci] - '0', lblColor);
+    }
+  }
+  // Vertical lines at 1h and 2h back (time mode only)
+  if (useTime) {
+    for (int hBack = 1; hBack <= 2; hBack++) {
+      long age = (long)hBack * 3600L;
+      if (age >= (long)BG_HISTORY_WINDOW_SEC) continue;
+      int16_t vx = x + 5 + (int16_t)((1.0f - (float)age / BG_HISTORY_WINDOW_SEC) * (w - 10));
+      if (vx > x && vx < x + w)
+        surface.drawFastVLine(vx, y, h, gridColor);
+    }
+  }
+
+  // Threshold lines (drawn on top of grid)
+  int16_t yLow  = y + h - (int16_t)((BG_LOW  - GRAPH_MMOL_MIN) / mmolRange * h);
+  int16_t yHigh = y + h - (int16_t)((BG_HIGH - GRAPH_MMOL_MIN) / mmolRange * h);
+  surface.drawFastHLine(x, yLow,  w, toPanelColor(0x001F));  // dim blue
+  surface.drawFastHLine(x, yHigh, w, toPanelColor(0xA000));  // dim red
 
   int16_t prevPx = -1, prevPy = -1;
 
@@ -401,6 +474,8 @@ void drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h
     surface.fillCircle(px, py, dotR, pc);
     prevPx = px; prevPy = py;
   }
+
+  surface.endWrite();  // release SPI bus (paired with startWrite at function entry)
 }
 
 // ---- Arrow ----
@@ -465,22 +540,37 @@ void updateGlycemia() {
   if (debugLogging)
     Serial.printf("updateGlycemia: %s delta=%s min=%lu\n", sgvStr, deltaStr, minSince);
 
-  tft.fillScreen(toPanelColor(backGroundColor));
-
-  const uint16_t bgCol  = hasData ? bgValueColor(ns.sensSgv) : toPanelColor(textColor);
-  const uint16_t txtCol = toPanelColor(textColor);
+  // Compute layout variables early — needed to split the clear into two targeted rects
+  // instead of one full-screen blank (fillScreen) that causes visible flicker.
   const uint16_t bgFill = toPanelColor(backGroundColor);
-
-  tft.setFreeFont(nullptr);
-  tft.setTextFont(2);
-  tft.setTextSize(1);
-
-  // Build shared strings used in both layouts
   const bool hasIob   = hasData && ns.iob > 0.05f;
   const bool hasCob   = hasData && ns.cob > 0;
   const bool hasBolus = hasData && ns.lastBolusU > 0.0f && ns.lastBolusAgeMins > 0;
   const bool hasRow2  = hasIob || hasCob || hasBolus;
   const bool hasPump  = hasData && (ns.pumpReservoir > 0.1f || ns.pumpBattery < 255);
+
+  // Layout parameters (portrait vs landscape)
+  const int16_t margin = isPortrait ? 4   : 8;
+  const int16_t row1Y  = isPortrait ? 108 : 98;
+  const int16_t row2Y  = isPortrait ? 124 : 116;
+  const int16_t row3Y  = isPortrait ? 140 : 134;
+  const int16_t gyPump = isPortrait ? 164 : 152;
+  const int16_t gyR2   = isPortrait ? 150 : 132;
+  const int16_t gyNone = isPortrait ? 132 : 122;
+
+  const int16_t gx = 12;
+  const int16_t gy = hasPump ? gyPump : (hasRow2 ? gyR2 : gyNone);
+  const int16_t gw = W - 24;
+  const int16_t gh = H - gy - 8;
+
+  tft.fillScreen(toPanelColor(backGroundColor));
+
+  const uint16_t bgCol  = hasData ? bgValueColor(ns.sensSgv) : toPanelColor(textColor);
+  const uint16_t txtCol = toPanelColor(textColor);
+
+  tft.setFreeFont(nullptr);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
 
   char leftStr[24] = {}, bolStr[16] = {}, resStr[16] = {}, batStr[16] = {};
   if (hasIob && hasCob)
@@ -513,15 +603,6 @@ void updateGlycemia() {
     snprintf(timeStr, sizeof(timeStr), "%lu min", minSince);
     timeCol = (minSince >= 10) ? toPanelColor(TFT_YELLOW) : txtCol;
   }
-
-  // Layout parameters (portrait vs landscape)
-  const int16_t margin = isPortrait ? 4   : 8;
-  const int16_t row1Y  = isPortrait ? 108 : 98;
-  const int16_t row2Y  = isPortrait ? 124 : 116;
-  const int16_t row3Y  = isPortrait ? 140 : 134;
-  const int16_t gyPump = isPortrait ? 164 : 152;
-  const int16_t gyR2   = isPortrait ? 150 : 132;
-  const int16_t gyNone = isPortrait ? 132 : 122;
 
   // Row 0 — clock (both modes)
   tft.setTextColor(txtCol, bgFill);
@@ -591,10 +672,6 @@ void updateGlycemia() {
   }
 
   // Graph (shared)
-  const int16_t gx = 12;
-  const int16_t gy = hasPump ? gyPump : (hasRow2 ? gyR2 : gyNone);
-  const int16_t gw = W - 24;
-  const int16_t gh = H - gy - 8;
   tft.drawFastHLine(0, gy - 6, W, toPanelColor(TFT_DARKGREY));
   drawMiniGraph(tft, gx, gy, gw, gh, utcNow);
 }
@@ -612,15 +689,30 @@ void setupWifi() {
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     Serial.printf("[WiFi] Reconnected — IP: %s, RSSI: %d dBm\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    lastNsFetchMs = 0;  // trigger immediate Nightscout fetch
+    // Force an immediate fetch on the next loop() iteration. Using a flag here
+    // instead of resetting lastNsFetchMs to 0: "millis() - 0 >= INTERVAL" is
+    // false for the first 5 minutes of uptime, so a reconnect shortly after
+    // boot would silently wait out the rest of the interval before fetching.
+    forceNsFetch = true;
   }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
 
+  // WiFi is "enabled" (managed + retried) whenever an SSID is configured, even if
+  // the first connect attempt fails. The loop watchdog keeps retrying so WiFi can
+  // act as the primary source (no BLE) or as a fallback when BLE data goes stale.
+  wifiEnabled = (cfg.wifi_ssid[0] != '\0');
+
   // Always start configuration AP so the web interface is reachable at 192.168.4.1
-  WiFi.mode(cfg.wifi_ssid[0] ? WIFI_AP_STA : WIFI_AP);
+  WiFi.mode(wifiEnabled ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP("CYDrip-Setup");
   Serial.println(F("Config AP started: CYDrip-Setup / 192.168.4.1"));
 
-  if (cfg.wifi_ssid[0] == '\0') return;
+  if (!wifiEnabled) return;
+
+  // Configure SNTP now — it resolves in the background once the network is up.
+  // getLocalTimeInSeconds() only trusts the clock after ntpSynced flips true
+  // (set below on immediate connect, or later in loop() when the link comes up).
+  const char *ntpSrv = cfg.ntp_server[0] ? cfg.ntp_server : "pool.ntp.org";
+  configTime(utcOffsetSec, 0, ntpSrv, "time.google.com");
 
   Serial.printf("Connecting to WiFi: %s\n", cfg.wifi_ssid);
   tft.println(F("Connecting WiFi..."));
@@ -629,14 +721,10 @@ void setupWifi() {
   while (WiFi.status() != WL_CONNECTED && millis() - t < 10000UL)
     delay(200);
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("WiFi STA failed, AP-only mode"));
+    Serial.println(F("WiFi STA not up yet — will keep retrying in background"));
     return;
   }
-  wifiEnabled = true;
   Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
-  // NTP — use configured server, fallback to pool.ntp.org
-  const char *ntpSrv = cfg.ntp_server[0] ? cfg.ntp_server : "pool.ntp.org";
-  configTime(utcOffsetSec, 0, ntpSrv, "time.google.com");
   struct tm t2;
   if (getLocalTime(&t2, 5000)) {
     ntpSynced = true;
@@ -677,6 +765,7 @@ void fetchNightscout() {
 
   // Update immediately — prevents busy-loop retries when all error paths return early
   lastNsFetchMs = millis();
+  forceNsFetch  = false;
 
   uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   bool isHttps = (strncmp(cfg.ns_url, "https://", 8) == 0);
@@ -732,9 +821,21 @@ void fetchNightscout() {
 
   if (sgvMgDl <= 0) return;
 
+  // Source arbitration: WiFi/Nightscout is a fallback. If BLE (or a previous
+  // fetch) already gave us a reading at least as recent as this one, keep it —
+  // don't let an older NS reading clobber fresher live BLE data. When BLE is
+  // absent or stale, NS is always newer and takes over as the primary source.
+  unsigned long nsLatestTs = (unsigned long)(dateMs / 1000ULL);
+  if (timeStampLatestBgReadingInSecondsUTC > 0 &&
+      nsLatestTs <= timeStampLatestBgReadingInSecondsUTC) {
+    Serial.printf("[NS] current data fresher (have %lu, ns %lu) — BLE wins, skip\n",
+                  timeStampLatestBgReadingInSecondsUTC, nsLatestTs);
+    return;
+  }
+
   ns.sensSgvMgDl = sgvMgDl;
   ns.sensSgv     = mgdlToMmol(sgvMgDl);
-  timeStampLatestBgReadingInSecondsUTC = (unsigned long)(dateMs / 1000ULL);
+  timeStampLatestBgReadingInSecondsUTC = nsLatestTs;
   strlcpy(ns.sensDir, dir, sizeof(ns.sensDir));
   setNsArrowAngle();
 
@@ -810,6 +911,8 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
           for (int i = 0; i < 10; i++)
             cfg.blepassword[i] = alpha[random(0, 36)];
           cfg.blepassword[10] = '\0';
+          // Persist so the same password is reused after a reboot (no re-pairing).
+          saveCYDConfigToNVS(cfg);
           bleNotifyText(0x0E, cfg.blepassword);
         } else {
           // Password stored — send bypass (authenticated, no check)
@@ -921,7 +1024,10 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
 class BLEServerCallBack : public BLEServerCallbacks {
   void onConnect(BLEServer *pSrv) {
     Serial.println(F("BLE connect"));
-    // Continue advertising so a second client can also connect
+    // Pre-authenticate on reconnect when a password is already established.
+    // Prevents readings being blocked if the auth notification (0x0F) is dropped
+    // before the client re-subscribes to notifications (CCCD race on reconnect).
+    if (cfg.blepassword[0] != '\0') bleAuthenticated = true;
     pSrv->getAdvertising()->start();
   }
   void onDisconnect(BLEServer *pSrv) {
@@ -1000,8 +1106,13 @@ void setup() {
                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   webConfigBegin(cfg, tft, displayColorsInverted);
   tft.println(F("Config: 192.168.4.1"));
-  tft.println(F("Waiting for CYDDrip..."));
-  setupBLE();
+  // Settle delay: initializing the Bluedroid stack immediately after a WiFi/TLS
+  // handshake has been observed to crash (StoreProhibited in bta_sys_init/memset,
+  // called from the BTU task at startup) — same class of BLE-stack flakiness as
+  // the blePause()/bleResume() mitigation below, just hitting cold init instead
+  // of re-init. Give the WiFi/BT coexistence state a moment to settle first.
+  delay(300);
+  setupBLE();  // BLE + WiFi coexist; fetchNightscout() pauses BLE for the SSL handshake
   Serial.printf("Post-BLE heap: free=%u  largest=%u\n",
                 ESP.getFreeHeap(),
                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -1023,8 +1134,21 @@ void loop() {
     }
   }
 
-  if (wifiEnabled && millis() - lastNsFetchMs >= NS_FETCH_INTERVAL_MS)
+  // Opportunistic NTP sync once the link comes up (covers late connect / reconnect,
+  // where the initial blocking sync in setupWifi() never ran).
+  if (wifiEnabled && !ntpSynced && WiFi.status() == WL_CONNECTED) {
+    struct tm tnow;
+    if (getLocalTime(&tnow, 0)) {
+      ntpSynced = true;
+      Serial.println(F("[NTP] synced"));
+    }
+  }
+
+  if (wifiEnabled && WiFi.status() == WL_CONNECTED &&
+      (forceNsFetch || millis() - lastNsFetchMs >= NS_FETCH_INTERVAL_MS)) {
+    forceNsFetch = false;
     fetchNightscout();
+  }
   delay(20);
   unsigned long utc = getUTCTimeInSeconds();
   unsigned long elapsed = millis() - msCount;
