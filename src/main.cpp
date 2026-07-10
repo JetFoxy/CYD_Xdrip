@@ -31,6 +31,7 @@
 #include "WebConfig.h"
 #include <cstring>
 #include <string>
+#include <esp_task_wdt.h>
 
 // ESP32-2432S028: SD card on VSPI (pins 18/19/23), CS = GPIO 5
 #define SD_CS_PIN 5
@@ -89,6 +90,13 @@ static unsigned long lastWifiReconnectMs = 0;
 static int           wifiDisconnects    = 0;   // total disconnect events
 static const unsigned long NS_FETCH_INTERVAL_MS    = 5UL * 60UL * 1000UL;  // 5 min
 static const unsigned long WIFI_RECONNECT_INTERVAL = 30UL * 1000UL;        // 30 sec
+
+// Task watchdog: reboots automatically if loop() ever stops making progress
+// (BLE stack hang, a blocking call that never returns, etc.) instead of needing
+// a physical power cycle. 30s comfortably exceeds the longest legitimate single
+// blocking stretch in loop() (15s HTTP timeout + a couple seconds of BLE
+// pause/resume), while still being far short of "forever".
+static const uint32_t WDT_TIMEOUT_S = 30;
 
 // ---- BLE/WiFi coexistence ----
 // With the framework's bundled Bluedroid BLE stack, repeatedly deiniting/reiniting
@@ -1102,6 +1110,16 @@ void setup() {
   BG_WARN_LOW  = cfg.bg_warn_low;
   BG_WARN_HIGH = cfg.bg_warn_high;
   BG_HIGH      = cfg.bg_high;
+  // CYD.INI documents these thresholds as being in mg/dL when show_mgdl=1, but
+  // every internal comparison (bgValueColor, checkAlarms, the graph) works in
+  // mmol/L — convert once here so a mg/dL config doesn't silently compare
+  // mg/dL numbers (e.g. 70/180) against mmol/L readings (e.g. 3.9-15).
+  if (cfg.show_mgdl == 1) {
+    BG_LOW       = mgdlToMmol(BG_LOW);
+    BG_WARN_LOW  = mgdlToMmol(BG_WARN_LOW);
+    BG_WARN_HIGH = mgdlToMmol(BG_WARN_HIGH);
+    BG_HIGH      = mgdlToMmol(BG_HIGH);
+  }
   blLevelIdx   = cfg.brightness;
 
   // Apply rotation: NVS-saved toggle state, overridden by CYD.INI if explicitly set
@@ -1126,11 +1144,16 @@ void setup() {
   Serial.printf("Post-BLE heap: free=%u  largest=%u\n",
                 ESP.getFreeHeap(),
                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);  // panic+reboot if loop() ever stops feeding it
+  esp_task_wdt_add(NULL);
+  Serial.printf("Task watchdog armed: %us timeout\n", WDT_TIMEOUT_S);
 }
 
 // ---- Main loop ----
 
 void loop() {
+  esp_task_wdt_reset();
   webConfigHandle();
   handleBrightnessButton();
   handleAlarmButton();
