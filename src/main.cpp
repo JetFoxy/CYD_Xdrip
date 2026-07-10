@@ -91,6 +91,18 @@ static int           wifiDisconnects    = 0;   // total disconnect events
 static const unsigned long NS_FETCH_INTERVAL_MS    = 5UL * 60UL * 1000UL;  // 5 min
 static const unsigned long WIFI_RECONNECT_INTERVAL = 30UL * 1000UL;        // 30 sec
 
+// ---- BLE/WiFi coexistence ----
+// Repeatedly deiniting and re-initing the Bluedroid stack (to free heap for TLS)
+// was tested on real hardware and reliably hangs the device (esp_bt_controller_mem_release()
+// is a one-way operation in ESP-IDF; re-running BLEDevice::init() afterwards is not a
+// supported/reliable path). So BLE is only ever paused ONCE, permanently, per boot —
+// never resumed — once it's been unused long enough that we're confident no phone is
+// relying on it. Until then, NS fetches simply skip themselves when heap is too
+// fragmented for the TLS buffers rather than touching BLE at all.
+static volatile unsigned long bleLastActivityMs = 0;      // millis() of last BLE connect/data
+static bool                   bleAbandoned      = false;  // true once BLE has been permanently freed
+static const unsigned long    BLE_ABANDON_TIMEOUT_MS = 15UL * 60UL * 1000UL;  // 15 min
+
 // ---- State ----
 static const int          historySize          = 180;         // 3 h at 1-min resolution
 static const unsigned long BG_HISTORY_WINDOW_SEC = 3UL * 3600UL; // graph time window
@@ -732,28 +744,23 @@ void setupWifi() {
   }
 }
 
-// Temporarily deinit BLE to free ~89 KB for the SSL handshake.
-// Called only when heap is too fragmented for HTTPS with BLE running.
-static void blePause() {
-  Serial.printf("[BLE] Pausing for HTTPS. heap: %u  largest: %u\n",
+// Permanently free the BLE stack's heap so HTTPS/TLS can get a contiguous block.
+// One-way — see the coexistence note above for why re-initializing BLE afterwards
+// is not attempted. Only called once we're confident no phone is using BLE.
+static void abandonBleForWifi() {
+  Serial.printf("[BLE] Idle %lu+ min — freeing BLE heap for WiFi/NS permanently. heap: %u  largest: %u\n",
+                BLE_ABANDON_TIMEOUT_MS / 60000UL,
                 ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  // Stop advertising first so clients disconnect cleanly
   if (pServer) pServer->getAdvertising()->stop();
   delay(100);
   BLEDevice::deinit(true);
   pServer             = nullptr;
   pRxTxCharacteristic = nullptr;
   bleAuthenticated    = false;
+  bleAbandoned        = true;
   delay(200);  // let Bluedroid stack fully unwind before any heap use
-  Serial.printf("[BLE] Paused.  heap: %u  largest: %u\n",
+  Serial.printf("[BLE] Freed. heap: %u  largest: %u\n",
                 ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-}
-
-static void bleResume() {
-  Serial.println(F("[BLE] Resuming after fetch..."));
-  delay(100);
-  setupBLE();
-  Serial.printf("[BLE] Resumed. heap: %u\n", ESP.getFreeHeap());
 }
 
 void fetchNightscout() {
@@ -772,9 +779,20 @@ void fetchNightscout() {
   Serial.printf("[NS] Fetching... RSSI: %d dBm  heap: %u  largest: %u\n",
                 WiFi.RSSI(), ESP.getFreeHeap(), largestBlock);
 
-  // SSL handshake needs ~32 KB contiguous. Pause BLE (~89 KB) if heap is tight.
-  bool pausedBle = (isHttps && pServer != nullptr && largestBlock < 40000);
-  if (pausedBle) blePause();
+  // SSL handshake needs ~32 KB contiguous, which BLE's own footprint prevents.
+  // Never deinit/reinit BLE per-fetch (see coexistence note above) — if BLE has
+  // been idle long enough that nobody's relying on it, free it once and for all;
+  // otherwise just skip this fetch cycle and try again next interval.
+  if (isHttps && pServer != nullptr && largestBlock < 40000) {
+    unsigned long sinceActivity = bleLastActivityMs > 0 ? (millis() - bleLastActivityMs) : millis();
+    if (sinceActivity >= BLE_ABANDON_TIMEOUT_MS) {
+      abandonBleForWifi();
+      largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    } else {
+      Serial.println(F("[NS] Skipping fetch — BLE active/recent, heap too fragmented for TLS"));
+      return;
+    }
+  }
 
   // Fetch last 36 entries (3 hours of 5-min readings)
   String base = cfg.ns_url;
@@ -791,12 +809,15 @@ void fetchNightscout() {
   } else {
     http.begin(url);
   }
-  http.setTimeout(8000);
+  // 8s was too tight on a weak/marginal link (RSSI ~ -70 to -76 dBm reproduced
+  // repeated HTTPC_ERROR_READ_TIMEOUT / -11 on real hardware, even though the
+  // server itself answers in under 100ms — the TLS handshake+read needs more
+  // slack when the radio link is lossy).
+  http.setTimeout(15000);
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("[NS] HTTP %d\n", code);
+    Serial.printf("[NS] HTTP %d (RSSI %d dBm)\n", code, WiFi.RSSI());
     http.end();
-    if (pausedBle) bleResume();
     return;
   }
 
@@ -805,11 +826,8 @@ void fetchNightscout() {
   http.end();
   if (err || !doc.is<JsonArray>() || doc.as<JsonArray>().size() == 0) {
     Serial.printf("[NS] JSON error: %s\n", err.c_str());
-    if (pausedBle) bleResume();
     return;
   }
-
-  if (pausedBle) bleResume();
 
   JsonArray arr = doc.as<JsonArray>();
 
@@ -888,6 +906,8 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pChar) {
     std::string rx = pChar->getValue();
     if (rx.empty()) return;
+
+    bleLastActivityMs = millis();  // any traffic counts as "BLE in use"
 
     int rxLen = (int)rx.length();
     if (rxLen > BLE_RX_MAX_BYTES) rxLen = BLE_RX_MAX_BYTES;
@@ -1024,6 +1044,7 @@ class BLECharacteristicCallBack : public BLECharacteristicCallbacks {
 class BLEServerCallBack : public BLEServerCallbacks {
   void onConnect(BLEServer *pSrv) {
     Serial.println(F("BLE connect"));
+    bleLastActivityMs = millis();
     // Pre-authenticate on reconnect when a password is already established.
     // Prevents readings being blocked if the auth notification (0x0F) is dropped
     // before the client re-subscribes to notifications (CCCD race on reconnect).
@@ -1108,11 +1129,11 @@ void setup() {
   tft.println(F("Config: 192.168.4.1"));
   // Settle delay: initializing the Bluedroid stack immediately after a WiFi/TLS
   // handshake has been observed to crash (StoreProhibited in bta_sys_init/memset,
-  // called from the BTU task at startup) — same class of BLE-stack flakiness as
-  // the blePause()/bleResume() mitigation below, just hitting cold init instead
-  // of re-init. Give the WiFi/BT coexistence state a moment to settle first.
+  // called from the BTU task at startup). This is the ONLY BLE init for the whole
+  // boot — see the coexistence note near bleLastActivityMs for why fetchNightscout()
+  // never calls BLEDevice::init() again after this.
   delay(300);
-  setupBLE();  // BLE + WiFi coexist; fetchNightscout() pauses BLE for the SSL handshake
+  setupBLE();  // BLE + WiFi coexist; fetchNightscout() skips itself (or frees BLE once) if heap is tight
   Serial.printf("Post-BLE heap: free=%u  largest=%u\n",
                 ESP.getFreeHeap(),
                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
