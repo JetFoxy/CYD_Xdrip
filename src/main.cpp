@@ -79,7 +79,7 @@ static const char* BLE_DEVICE_NAME       = "CYDDrip";
 static const char* BLE_SERVICE_UUID      = "AF6E5F78-706A-43FB-B1F4-C27D7D5C762F";
 static const char* BLE_CHAR_UUID         = "6D810E9F-0983-4030-BDA7-C7C9A6A19C1C";
 static const int   BLE_TX_MAX_BYTES      = 20;   // max notification payload
-static const int   BLE_RX_MAX_BYTES      = 128;  // max write payload (0x21 = 3+35×2=73 bytes)
+static const int   BLE_RX_MAX_BYTES      = 150;  // max write payload (0x21 = 3+72×2=147 bytes for a 6h/5-min history)
 
 // ---- WiFi state ----
 static bool          wifiEnabled        = false;
@@ -93,10 +93,10 @@ static const unsigned long WIFI_RECONNECT_INTERVAL = 30UL * 1000UL;        // 30
 
 // Task watchdog: reboots automatically if loop() ever stops making progress
 // (BLE stack hang, a blocking call that never returns, etc.) instead of needing
-// a physical power cycle. 30s comfortably exceeds the longest legitimate single
-// blocking stretch in loop() (15s HTTP timeout + a couple seconds of BLE
+// a physical power cycle. 35s comfortably exceeds the longest legitimate single
+// blocking stretch in loop() (20s HTTP timeout + a couple seconds of BLE
 // pause/resume), while still being far short of "forever".
-static const uint32_t WDT_TIMEOUT_S = 30;
+static const uint32_t WDT_TIMEOUT_S = 35;
 
 // ---- BLE/WiFi coexistence ----
 // With the framework's bundled Bluedroid BLE stack, repeatedly deiniting/reiniting
@@ -109,8 +109,8 @@ static const uint32_t WDT_TIMEOUT_S = 30;
 // connection) that this threshold rarely even triggers in the first place.
 
 // ---- State ----
-static const int          historySize          = 180;         // 3 h at 1-min resolution
-static const unsigned long BG_HISTORY_WINDOW_SEC = 3UL * 3600UL; // graph time window
+static const int          historySize          = 180;         // capacity ceiling; 6h window only needs 72 slots @ 5-min
+static const unsigned long BG_HISTORY_WINDOW_SEC = 6UL * 3600UL; // graph time window
 static const unsigned long BG_PREFILL_INTERVAL_SEC = 5UL * 60UL; // assumed CGM interval for 0x21
 static const unsigned long BG_FRESHNESS_SEC      = 7UL * 60UL;  // staleness threshold for display
 static const unsigned long BTN_LONG_PRESS_MS     = 800UL;       // long-press threshold
@@ -174,6 +174,15 @@ NimBLEServer         *pServer             = nullptr;
 NimBLECharacteristic *pRxTxCharacteristic = nullptr;
 bool               bleAuthenticated    = false;
 byte               rxBuf[BLE_RX_MAX_BYTES];
+
+// Fixed-size, reused-every-cycle buffer for the Nightscout response body.
+// A fresh String sized to whatever the response happens to be (55-80+ KB,
+// varies cycle to cycle) fragments the heap over hours of uptime — confirmed
+// on hardware: largest contiguous block got stuck at ~65 KB even right after
+// pausing BLE, with no BLE client connected to blame. One static buffer,
+// allocated once at link time (not on the heap), sidesteps that entirely.
+static const size_t NS_BODY_BUF_SIZE = 61440;  // observed ~55 KB responses; DRAM segment is far tighter than heap free-space numbers suggest
+static char nsBodyBuf[NS_BODY_BUF_SIZE];
 
 // ---- Forward declarations ----
 void     setupBLE();
@@ -444,11 +453,12 @@ void drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h
           drawTinyDigit(surface, lx, gridY - 8, lbl[ci] - '0', lblColor);
     }
   }
-  // Vertical lines at 1h and 2h back (time mode only)
+  // Two vertical dividers splitting the window into equal thirds (time mode only)
+  // — scales with BG_HISTORY_WINDOW_SEC instead of hardcoding hour boundaries,
+  // so a wider window (e.g. 6h) doesn't need its gridline count adjusted by hand.
   if (useTime) {
-    for (int hBack = 1; hBack <= 2; hBack++) {
-      long age = (long)hBack * 3600L;
-      if (age >= (long)BG_HISTORY_WINDOW_SEC) continue;
+    const long thirds[2] = { (long)BG_HISTORY_WINDOW_SEC / 3, (long)BG_HISTORY_WINDOW_SEC * 2 / 3 };
+    for (long age : thirds) {
       int16_t vx = x + 5 + (int16_t)((1.0f - (float)age / BG_HISTORY_WINDOW_SEC) * (w - 10));
       if (vx > x && vx < x + w)
         surface.drawFastVLine(vx, y, h, gridColor);
@@ -790,16 +800,36 @@ void fetchNightscout() {
   Serial.printf("[NS] Fetching... RSSI: %d dBm  heap: %u  largest: %u\n",
                 WiFi.RSSI(), ESP.getFreeHeap(), largestBlock);
 
-  // SSL handshake needs ~32 KB contiguous. Pause BLE if heap is ever that tight.
+  // SSL handshake needs ~32 KB contiguous. The response body itself now goes into
+  // a fixed static buffer (nsBodyBuf, see above), not a heap-allocated String, so
+  // its size no longer factors into this threshold.
   bool pausedBle = (isHttps && pServer != nullptr && largestBlock < 40000);
   if (pausedBle) blePause();
 
-  // Fetch last 36 entries (3 hours of 5-min readings)
-  String base = cfg.ns_url;
-  if (base.endsWith("/")) base.remove(base.length() - 1);
-  String url = base + "/api/v1/entries.json?count=36&fields=sgv,date,direction";
-  if (cfg.ns_token[0]) { url += "&token="; url += cfg.ns_token; }
-  Serial.printf("[NS] host: %s\n", base.c_str());
+  // Request more raw entries than the 72 we actually need (6h @ 5-min, matching
+  // BG_HISTORY_WINDOW_SEC): some NS instances have multiple upload sources
+  // posting near-duplicate entries per timestamp, and the dedup pass below
+  // needs enough raw material left over after filtering those out.
+  //
+  // Built with snprintf into stack buffers rather than String concatenation —
+  // this runs every 5 minutes forever, and repeated String allocs/frees of
+  // varying sizes is exactly the pattern that fragments the heap over long
+  // uptime (confirmed on hardware: TLS handshake failing with "SSL - Memory
+  // allocation failed" because the largest free block had shrunk to ~22 KB,
+  // below the ~32 KB it needs, even right after pausing BLE).
+  char base[sizeof(cfg.ns_url)];
+  strlcpy(base, cfg.ns_url, sizeof(base));
+  size_t baseLen = strlen(base);
+  if (baseLen > 0 && base[baseLen - 1] == '/') base[baseLen - 1] = '\0';
+
+  char url[sizeof(cfg.ns_url) + sizeof(cfg.ns_token) + 64];
+  if (cfg.ns_token[0]) {
+    snprintf(url, sizeof(url), "%s/api/v1/entries.json?count=150&fields=sgv,date,direction&token=%s",
+             base, cfg.ns_token);
+  } else {
+    snprintf(url, sizeof(url), "%s/api/v1/entries.json?count=150&fields=sgv,date,direction", base);
+  }
+  Serial.printf("[NS] host: %s\n", base);
 
   HTTPClient http;
   WiFiClientSecure secureClient;
@@ -812,8 +842,10 @@ void fetchNightscout() {
   // 8s was too tight on a weak/marginal link (RSSI ~ -70 to -76 dBm reproduced
   // repeated HTTPC_ERROR_READ_TIMEOUT / -11 on real hardware, even though the
   // server itself answers in under 100ms — the TLS handshake+read needs more
-  // slack when the radio link is lossy).
-  http.setTimeout(15000);
+  // slack when the radio link is lossy). Bumped again for the 6h history fetch
+  // (count=150 raw entries, ~55 KB body on an NS with multiple upload sources —
+  // roughly double the old 3h/36-entry payload).
+  http.setTimeout(20000);
   int code = http.GET();
   if (code != 200) {
     Serial.printf("[NS] HTTP %d (RSSI %d dBm)\n", code, WiFi.RSSI());
@@ -822,11 +854,44 @@ void fetchNightscout() {
     return;
   }
 
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, http.getStream());
+  // Read the body into the fixed static buffer ourselves rather than either
+  // HTTPClient::getString() (allocates a fresh heap String sized to the
+  // response every cycle — fragments the heap over hours of uptime, confirmed
+  // on hardware) or deserializeJson(doc, http.getStream()) directly (its naive
+  // stream reader mistook a transient stream.available()==0 mid-transfer for
+  // end-of-input on a marginal WiFi link — "IncompleteInput" — even though the
+  // rest of the response was still in flight). Stream::readBytes() already
+  // retries internally up to its own timeout; looping it against an overall
+  // deadline gets the patience of buffering without a heap allocation.
+  WiFiClient &stream = http.getStream();
+  size_t bodyLen = 0;
+  unsigned long readDeadline = millis() + 20000UL;
+  while (bodyLen < NS_BODY_BUF_SIZE - 1 && millis() < readDeadline) {
+    size_t n = stream.readBytes(nsBodyBuf + bodyLen, NS_BODY_BUF_SIZE - 1 - bodyLen);
+    bodyLen += n;
+    if (n == 0 && !http.connected() && stream.available() == 0) break;
+  }
+  nsBodyBuf[bodyLen] = '\0';
   http.end();
+
+  // The "fields=sgv,date,direction" query param is advisory — some Nightscout
+  // instances (e.g. ones with multiple upload sources like AAPS + xDrip) ignore
+  // it and return every field (_id, app, device, created_at, ...) per entry
+  // regardless. Filtering at deserialize time makes ArduinoJson skip storing
+  // those unused fields instead of allocating nodes for them.
+  // Filter must mirror the input's shape: NS returns a top-level array, so the
+  // filter needs to be an array too — one template object applied to every
+  // element — not a bare object (which silently matches nothing here).
+  JsonDocument filter;
+  JsonObject filterElem = filter.add<JsonObject>();
+  filterElem["sgv"]       = true;
+  filterElem["date"]      = true;
+  filterElem["direction"] = true;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, nsBodyBuf, DeserializationOption::Filter(filter));
   if (err || !doc.is<JsonArray>() || doc.as<JsonArray>().size() == 0) {
-    Serial.printf("[NS] JSON error: %s\n", err.c_str());
+    Serial.printf("[NS] JSON error: %s (body %u bytes)\n", err.c_str(), (unsigned)bodyLen);
     if (pausedBle) bleResume();
     return;
   }
@@ -861,17 +926,34 @@ void fetchNightscout() {
   strlcpy(ns.sensDir, dir, sizeof(ns.sensDir));
   setNsArrowAngle();
 
-  // Populate full history (API returns newest first — same order as readingHistory)
-  int count = (int)arr.size();
-  if (count > historySize) count = historySize;
-  for (int i = 0; i < count; i++) {
+  // Populate history (API returns newest first — same order as readingHistory).
+  // Some Nightscout instances have multiple upload sources (e.g. AAPS + xDrip
+  // both reporting the same CGM) that post near-duplicate entries at the same
+  // timestamp; copying the raw array 1:1 would burn half the slots on dupes and
+  // leave the graph covering far less real time than BG_HISTORY_WINDOW_SEC
+  // implies. Skip entries less than ~90% of a prefill interval newer than the
+  // last accepted one — same dedup rule the Android app already applies to its
+  // own local history.
+  int rawCount = (int)arr.size();
+  int slot = 0;
+  unsigned long lastAcceptedTs = 0;
+  for (int i = 0; i < rawCount && slot < historySize; i++) {
     float    v   = arr[i]["sgv"] | 0.0f;
     uint64_t dMs = arr[i]["date"] | (uint64_t)0;
-    readingHistory[i].mmol   = (v > 0) ? mgdlToMmol(v) : 0.0f;
-    readingHistory[i].utcSec = (unsigned long)(dMs / 1000ULL);
+    unsigned long ts = (unsigned long)(dMs / 1000ULL);
+    if (v <= 0 || ts == 0) continue;
+    if (lastAcceptedTs != 0 && (long)(lastAcceptedTs - ts) < (long)(BG_PREFILL_INTERVAL_SEC * 9 / 10)) continue;
+    readingHistory[slot].mmol   = mgdlToMmol(v);
+    readingHistory[slot].utcSec = ts;
+    lastAcceptedTs = ts;
+    slot++;
   }
   saveHistoryToNVS();
 
+  float coverageHours = lastAcceptedTs > 0
+    ? (float)(nsLatestTs - lastAcceptedTs) / 3600.0f : 0.0f;
+  Serial.printf("[NS] History: %d raw -> %d distinct slots, %.1fh coverage\n",
+                rawCount, slot, coverageHours);
   Serial.printf("[NS] OK: %.1f mmol/L %s (disconnects total: %d)\n",
                 ns.sensSgv, ns.sensDir, wifiDisconnects);
   updateGlycemia();
