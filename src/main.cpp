@@ -93,10 +93,13 @@ static const unsigned long WIFI_RECONNECT_INTERVAL = 30UL * 1000UL;        // 30
 
 // Task watchdog: reboots automatically if loop() ever stops making progress
 // (BLE stack hang, a blocking call that never returns, etc.) instead of needing
-// a physical power cycle. 35s comfortably exceeds the longest legitimate single
-// blocking stretch in loop() (20s HTTP timeout + a couple seconds of BLE
-// pause/resume), while still being far short of "forever".
-static const uint32_t WDT_TIMEOUT_S = 35;
+// a physical power cycle. http.setTimeout(20000) turned out not to bound the
+// initial TCP+TLS connect phase reliably — confirmed on hardware taking 49s
+// on a bad WiFi moment before failing — and that whole call is a single
+// library call we can't inject esp_task_wdt_reset() into (unlike the body-read
+// loop after it, which does feed the watchdog on its own). 60s gives comfortable
+// margin above that observed worst case while still being far short of "forever".
+static const uint32_t WDT_TIMEOUT_S = 60;
 
 // ---- BLE/WiFi coexistence ----
 // With the framework's bundled Bluedroid BLE stack, repeatedly deiniting/reiniting
@@ -800,10 +803,19 @@ void fetchNightscout() {
   Serial.printf("[NS] Fetching... RSSI: %d dBm  heap: %u  largest: %u\n",
                 WiFi.RSSI(), ESP.getFreeHeap(), largestBlock);
 
-  // SSL handshake needs ~32 KB contiguous. The response body itself now goes into
-  // a fixed static buffer (nsBodyBuf, see above), not a heap-allocated String, so
-  // its size no longer factors into this threshold.
-  bool pausedBle = (isHttps && pServer != nullptr && largestBlock < 40000);
+  // Always pause BLE for an HTTPS fetch, not just when heap is tight: the ESP32
+  // has ONE physical 2.4GHz radio shared between WiFi and BLE (unlike a phone
+  // or laptop, which have separate chips — this is why "other devices work
+  // fine" on the same network). BLE advertising (and any connected client)
+  // keeps grabbing radio time throughout a large/sustained HTTPS transfer,
+  // and that coexistence contention is a much better fit for what's actually
+  // been observed on hardware than heap alone: RSSI a non-catastrophic -69 to
+  // -72 dBm, yet dozens of back-to-back WIFI_REASON_NO_AP_FOUND disconnects
+  // and a connect+TLS handshake that took 120s despite a 20s HTTPClient
+  // timeout (the timeout doesn't bound mbedTLS's own blocking connect call).
+  // NimBLE's pause/resume is proven safe and fast on hardware, so freeing the
+  // radio for the whole fetch is a good trade even when heap isn't the issue.
+  bool pausedBle = (isHttps && pServer != nullptr);
   if (pausedBle) blePause();
 
   // Request more raw entries than the 72 we actually need (6h @ 5-min, matching
@@ -846,9 +858,11 @@ void fetchNightscout() {
   // (count=150 raw entries, ~55 KB body on an NS with multiple upload sources —
   // roughly double the old 3h/36-entry payload).
   http.setTimeout(20000);
+  unsigned long tGetStart = millis();
   int code = http.GET();
+  unsigned long tGetMs = millis() - tGetStart;
   if (code != 200) {
-    Serial.printf("[NS] HTTP %d (RSSI %d dBm)\n", code, WiFi.RSSI());
+    Serial.printf("[NS] HTTP %d (RSSI %d dBm, connect+headers took %lums)\n", code, WiFi.RSSI(), tGetMs);
     http.end();
     if (pausedBle) bleResume();
     return;
@@ -863,16 +877,28 @@ void fetchNightscout() {
   // rest of the response was still in flight). Stream::readBytes() already
   // retries internally up to its own timeout; looping it against an overall
   // deadline gets the patience of buffering without a heap allocation.
+  // This loop's own 20s deadline starts AFTER http.GET() already returned —
+  // which can itself block up to its own 20s timeout waiting on a slow link.
+  // Back-to-back that's up to ~40s in one loop() iteration, well past the 35s
+  // task watchdog, and was triggering a real (if well-intentioned) reboot on a
+  // slow-but-not-quite-timing-out connection. Feed the watchdog here too since
+  // we're still making genuine progress, not actually stuck.
   WiFiClient &stream = http.getStream();
   size_t bodyLen = 0;
-  unsigned long readDeadline = millis() + 20000UL;
+  int contentLen = http.getSize();
+  unsigned long tReadStart = millis();
+  unsigned long readDeadline = tReadStart + 20000UL;
   while (bodyLen < NS_BODY_BUF_SIZE - 1 && millis() < readDeadline) {
+    esp_task_wdt_reset();
     size_t n = stream.readBytes(nsBodyBuf + bodyLen, NS_BODY_BUF_SIZE - 1 - bodyLen);
     bodyLen += n;
     if (n == 0 && !http.connected() && stream.available() == 0) break;
   }
+  unsigned long readMs = millis() - tReadStart;
   nsBodyBuf[bodyLen] = '\0';
   http.end();
+  Serial.printf("[NS] timing: connect+headers=%lums  read=%lums (%u/%d bytes, RSSI %d dBm)\n",
+                tGetMs, readMs, (unsigned)bodyLen, contentLen, WiFi.RSSI());
 
   // The "fields=sgv,date,direction" query param is advisory — some Nightscout
   // instances (e.g. ones with multiple upload sources like AAPS + xDrip) ignore
