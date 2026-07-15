@@ -777,12 +777,26 @@ static void blePause() {
   pRxTxCharacteristic = nullptr;
   bleAuthenticated    = false;
   delay(100);
+  // Disable WiFi modem sleep for the fetch. ESP-IDF's coexistence arbiter
+  // requires modem sleep (WIFI_PS_MIN_MODEM, the default) whenever the BT
+  // controller is enabled — forcing WIFI_PS_NONE while BT is up crashes
+  // coex_core_enable() (confirmed on hardware; matches espressif/esp-idf#9595
+  // and h2zero/NimBLE-Arduino#437). Safe here because BLE is now fully
+  // deinitialized, so there's no coexistence conflict for the duration of
+  // the fetch. This is also what actually fixed the WiFi instability that
+  // prompted this investigation — reproduced on hardware as bursts of
+  // WIFI_REASON_NO_AP_FOUND disconnects and a connect+TLS handshake that
+  // once took 120s.
+  WiFi.setSleep(false);
   Serial.printf("[BLE] Paused.  heap: %u  largest: %u\n",
                 ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
 static void bleResume() {
   Serial.println(F("[BLE] Resuming after fetch..."));
+  // Restore modem sleep BEFORE re-enabling the BT controller inside setupBLE()
+  // — see the note in blePause() for why WIFI_PS_NONE + BT enabled crashes.
+  WiFi.setSleep(true);
   setupBLE();
   Serial.printf("[BLE] Resumed. heap: %u\n", ESP.getFreeHeap());
 }
