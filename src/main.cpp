@@ -3,7 +3,7 @@
     Adapted for ESP32-2432S028 (CYD) with ILI9341 2.8" display.
 
     Receives BG readings from CYDDrip Android app via BLE.
-    Protocol: CYDDrip BLE protocol (opcodes 0x09/0x0A/0x20/0x21).
+    Protocol: CYDDrip BLE protocol (opcodes 0x09/0x0A/0x20/0x21/0x22).
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -94,12 +94,13 @@ static const unsigned long WIFI_RECONNECT_INTERVAL = 30UL * 1000UL;        // 30
 // Task watchdog: reboots automatically if loop() ever stops making progress
 // (BLE stack hang, a blocking call that never returns, etc.) instead of needing
 // a physical power cycle. http.setTimeout(20000) turned out not to bound the
-// initial TCP+TLS connect phase reliably — confirmed on hardware taking 49s
-// on a bad WiFi moment before failing — and that whole call is a single
-// library call we can't inject esp_task_wdt_reset() into (unlike the body-read
-// loop after it, which does feed the watchdog on its own). 60s gives comfortable
-// margin above that observed worst case while still being far short of "forever".
-static const uint32_t WDT_TIMEOUT_S = 60;
+// initial TCP+TLS connect phase reliably — confirmed on hardware taking up to
+// 120s on a bad WiFi moment before failing (and once triggering a genuine
+// watchdog reboot at the previous 60s setting) — and that whole call is a
+// single library call we can't inject esp_task_wdt_reset() into (unlike the
+// body-read loop after it, which does feed the watchdog on its own). 150s
+// gives comfortable margin above the observed 120s worst case.
+static const uint32_t WDT_TIMEOUT_S = 150;
 
 // ---- BLE/WiFi coexistence ----
 // With the framework's bundled Bluedroid BLE stack, repeatedly deiniting/reiniting
@@ -116,6 +117,7 @@ static const int          historySize          = 180;         // capacity ceilin
 static const unsigned long BG_HISTORY_WINDOW_SEC = 6UL * 3600UL; // graph time window
 static const unsigned long BG_PREFILL_INTERVAL_SEC = 5UL * 60UL; // assumed CGM interval for 0x21
 static const unsigned long BG_FRESHNESS_SEC      = 7UL * 60UL;  // staleness threshold for display
+static const unsigned long BG_DELTA_MAX_GAP_SEC  = 7UL * 60UL;  // max gap between the two latest readings for delta to be meaningful
 static const unsigned long BTN_LONG_PRESS_MS     = 800UL;       // long-press threshold
 static const float         GRAPH_MMOL_MIN        = 2.5f;
 static const float         GRAPH_MMOL_MAX        = 15.0f;
@@ -125,6 +127,18 @@ struct BgReading {
   unsigned long utcSec = 0;      // UTC timestamp; 0 = unknown
 };
 static BgReading readingHistory[historySize];
+
+// Bolus markers overlaid on the mini graph (0x22). Android already dedupes/
+// buckets/filters (see AapsTreatmentCache.buildBolusHistoryEvents()) before
+// sending, so this just holds whatever it receives — capacity matches the
+// BLE_RX_MAX_BYTES packet cap, not a real-world dose-frequency estimate.
+static const int BOLUS_HISTORY_MAX = 24;
+struct BolusEvent {
+  unsigned long utcSec = 0;
+  float         units  = 0.0f;
+};
+static BolusEvent bolusHistory[BOLUS_HISTORY_MAX];
+static int         bolusHistoryCount = 0;
 
 unsigned long timeStampLatestBgReadingInSecondsUTC = 0;
 unsigned long msCount                              = 0;
@@ -370,6 +384,17 @@ unsigned long getUTCTimeInSeconds() {
 
 void getDeltaStr(char *buf, int bufSize) {
   if (readingHistory[0].mmol <= 0 || readingHistory[1].mmol <= 0) { buf[0] = '\0'; return; }
+  // If both readings carry timestamps, a gap wider than BG_DELTA_MAX_GAP_SEC means
+  // readingHistory[1] isn't actually the "previous" reading in any meaningful
+  // rate-of-change sense — e.g. after a long BLE/WiFi outage, the first reading
+  // to arrive gets compared against whatever was sitting in slot 0 before the
+  // gap, which could be 30+ minutes old. Blank the delta rather than show a
+  // misleadingly large jump computed across missing data.
+  if (readingHistory[0].utcSec > 0 && readingHistory[1].utcSec > 0 &&
+      readingHistory[0].utcSec - readingHistory[1].utcSec > BG_DELTA_MAX_GAP_SEC) {
+    buf[0] = '\0';
+    return;
+  }
   float d = readingHistory[0].mmol - readingHistory[1].mmol;
   if (cfg.show_mgdl == 1) {
     int di = (int)(d * 18.0f + (d >= 0 ? 0.5f : -0.5f));
@@ -503,6 +528,24 @@ void drawMiniGraph(TFT_eSPI &surface, int16_t x, int16_t y, int16_t w, int16_t h
     int16_t dotR = (prevPx >= 0 && px - prevPx >= 8) ? 2 : 1;
     surface.fillCircle(px, py, dotR, pc);
     prevPx = px; prevPy = py;
+  }
+
+  // Bolus markers — small triangles in a fixed strip near the top of the
+  // graph, independent of the mmol scale (matches the Android app's own
+  // AapsTreatmentCache.buildTreatmentLine(): a fixed row, not scaled by dose
+  // size, since amount differences aren't reliably legible at this
+  // resolution either way). Only meaningful with time sync (age-based x);
+  // without it there's no sensible x position for a bolus timestamp.
+  if (useTime) {
+    const uint16_t bolusColor = toPanelColor(TFT_CYAN);
+    const int16_t  markerY    = y + 3;
+    for (int i = 0; i < bolusHistoryCount; i++) {
+      if (bolusHistory[i].utcSec == 0) continue;
+      long age = (long)now - (long)bolusHistory[i].utcSec;
+      if (age < 0 || age > (long)BG_HISTORY_WINDOW_SEC) continue;
+      int16_t bx = x + 5 + (int16_t)((1.0f - (float)age / BG_HISTORY_WINDOW_SEC) * (w - 10));
+      surface.fillTriangle(bx - 2, markerY - 3, bx + 2, markerY - 3, bx, markerY + 2, bolusColor);
+    }
   }
 
   surface.endWrite();  // release SPI bus (paired with startWrite at function entry)
@@ -762,45 +805,6 @@ void setupWifi() {
   }
 }
 
-// Temporarily deinit BLE to free heap for the SSL handshake, then reinit it once
-// the fetch is done. Safe to repeat with NimBLE (unlike the old Bluedroid stack —
-// see the coexistence note above); kept only as a fallback since NimBLE's own
-// footprint (measured ~60-110 KB largest free block, even with a live BLE
-// connection) means this threshold rarely trips in practice.
-static void blePause() {
-  Serial.printf("[BLE] Pausing for HTTPS. heap: %u  largest: %u\n",
-                ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  if (pServer) pServer->getAdvertising()->stop();
-  delay(100);
-  NimBLEDevice::deinit(true);
-  pServer             = nullptr;
-  pRxTxCharacteristic = nullptr;
-  bleAuthenticated    = false;
-  delay(100);
-  // Disable WiFi modem sleep for the fetch. ESP-IDF's coexistence arbiter
-  // requires modem sleep (WIFI_PS_MIN_MODEM, the default) whenever the BT
-  // controller is enabled — forcing WIFI_PS_NONE while BT is up crashes
-  // coex_core_enable() (confirmed on hardware; matches espressif/esp-idf#9595
-  // and h2zero/NimBLE-Arduino#437). Safe here because BLE is now fully
-  // deinitialized, so there's no coexistence conflict for the duration of
-  // the fetch. This is also what actually fixed the WiFi instability that
-  // prompted this investigation — reproduced on hardware as bursts of
-  // WIFI_REASON_NO_AP_FOUND disconnects and a connect+TLS handshake that
-  // once took 120s.
-  WiFi.setSleep(false);
-  Serial.printf("[BLE] Paused.  heap: %u  largest: %u\n",
-                ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-}
-
-static void bleResume() {
-  Serial.println(F("[BLE] Resuming after fetch..."));
-  // Restore modem sleep BEFORE re-enabling the BT controller inside setupBLE()
-  // — see the note in blePause() for why WIFI_PS_NONE + BT enabled crashes.
-  WiFi.setSleep(true);
-  setupBLE();
-  Serial.printf("[BLE] Resumed. heap: %u\n", ESP.getFreeHeap());
-}
-
 void fetchNightscout() {
   if (!wifiEnabled || cfg.ns_url[0] == '\0') return;
   if (WiFi.status() != WL_CONNECTED) {
@@ -814,35 +818,40 @@ void fetchNightscout() {
 
   uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   bool isHttps = (strncmp(cfg.ns_url, "https://", 8) == 0);
-  Serial.printf("[NS] Fetching... RSSI: %d dBm  heap: %u  largest: %u\n",
-                WiFi.RSSI(), ESP.getFreeHeap(), largestBlock);
+  Serial.printf("[NS] Fetching... RSSI: %d dBm  heap: %u  largest: %u  minEverFree: %u\n",
+                WiFi.RSSI(), ESP.getFreeHeap(), largestBlock, ESP.getMinFreeHeap());
 
-  // Always pause BLE for an HTTPS fetch, not just when heap is tight: the ESP32
-  // has ONE physical 2.4GHz radio shared between WiFi and BLE (unlike a phone
-  // or laptop, which have separate chips — this is why "other devices work
-  // fine" on the same network). BLE advertising (and any connected client)
-  // keeps grabbing radio time throughout a large/sustained HTTPS transfer,
-  // and that coexistence contention is a much better fit for what's actually
-  // been observed on hardware than heap alone: RSSI a non-catastrophic -69 to
-  // -72 dBm, yet dozens of back-to-back WIFI_REASON_NO_AP_FOUND disconnects
-  // and a connect+TLS handshake that took 120s despite a 20s HTTPClient
-  // timeout (the timeout doesn't bound mbedTLS's own blocking connect call).
-  // NimBLE's pause/resume is proven safe and fast on hardware, so freeing the
-  // radio for the whole fetch is a good trade even when heap isn't the issue.
-  bool pausedBle = (isHttps && pServer != nullptr);
-  if (pausedBle) blePause();
+  // BLE is never started at all when WiFi+Nightscout is configured as the
+  // primary source (see the note in setup()) — so there's no pause/resume
+  // dance here anymore. That cycle used to run every 5 minutes and was
+  // confirmed on hardware to permanently leak heap each time
+  // (NimBLEDevice::deinit() doesn't fully release what init() allocated),
+  // which was the actual cause of both the SSL allocation failures after
+  // long uptime and a hard abort()/reboot in esp_bt_controller_init().
 
   // Request more raw entries than the 72 we actually need (6h @ 5-min, matching
   // BG_HISTORY_WINDOW_SEC): some NS instances have multiple upload sources
   // posting near-duplicate entries per timestamp, and the dedup pass below
-  // needs enough raw material left over after filtering those out.
+  // needs enough raw material left over after filtering those out. 120 was
+  // chosen over the original 150 as a deliberate trade-off: on this hardware,
+  // largest free contiguous block permanently settles to ~25-40 KB after the
+  // very first HTTPS connection of the boot (confirmed on hardware — happens
+  // even with BLE fully disabled and on a fully successful, non-timed-out
+  // fetch, so it isn't a BLE or JsonDocument leak; looks like a one-time,
+  // application-unfixable cost of ESP32 Arduino's lwIP/mbedTLS pools growing
+  // on first real use). With ~32 KB needed for the TLS handshake, that leaves
+  // little margin, so a smaller request means less JSON-parse footprint and a
+  // faster transfer — less time exposed to a slow/marginal link, which is what
+  // triggers both the intermittent "SSL - Memory allocation failed" retries
+  // and (once, on a very bad link) a genuine task-watchdog reboot when
+  // http.GET()'s connect phase blocked past the watchdog timeout. In exchange,
+  // dedup typically yields fewer distinct slots than the full 72 target on
+  // Nightscout instances with heavy upload-source duplication.
   //
   // Built with snprintf into stack buffers rather than String concatenation —
   // this runs every 5 minutes forever, and repeated String allocs/frees of
   // varying sizes is exactly the pattern that fragments the heap over long
-  // uptime (confirmed on hardware: TLS handshake failing with "SSL - Memory
-  // allocation failed" because the largest free block had shrunk to ~22 KB,
-  // below the ~32 KB it needs, even right after pausing BLE).
+  // uptime.
   char base[sizeof(cfg.ns_url)];
   strlcpy(base, cfg.ns_url, sizeof(base));
   size_t baseLen = strlen(base);
@@ -850,10 +859,10 @@ void fetchNightscout() {
 
   char url[sizeof(cfg.ns_url) + sizeof(cfg.ns_token) + 64];
   if (cfg.ns_token[0]) {
-    snprintf(url, sizeof(url), "%s/api/v1/entries.json?count=150&fields=sgv,date,direction&token=%s",
+    snprintf(url, sizeof(url), "%s/api/v1/entries.json?count=120&fields=sgv,date,direction&token=%s",
              base, cfg.ns_token);
   } else {
-    snprintf(url, sizeof(url), "%s/api/v1/entries.json?count=150&fields=sgv,date,direction", base);
+    snprintf(url, sizeof(url), "%s/api/v1/entries.json?count=120&fields=sgv,date,direction", base);
   }
   Serial.printf("[NS] host: %s\n", base);
 
@@ -869,16 +878,19 @@ void fetchNightscout() {
   // repeated HTTPC_ERROR_READ_TIMEOUT / -11 on real hardware, even though the
   // server itself answers in under 100ms — the TLS handshake+read needs more
   // slack when the radio link is lossy). Bumped again for the 6h history fetch
-  // (count=150 raw entries, ~55 KB body on an NS with multiple upload sources —
-  // roughly double the old 3h/36-entry payload).
+  // (count=120 raw entries, ~45 KB body on an NS with multiple upload sources —
+  // still well above the old 3h/36-entry payload).
   http.setTimeout(20000);
   unsigned long tGetStart = millis();
   int code = http.GET();
   unsigned long tGetMs = millis() - tGetStart;
   if (code != 200) {
     Serial.printf("[NS] HTTP %d (RSSI %d dBm, connect+headers took %lums)\n", code, WiFi.RSSI(), tGetMs);
+    Serial.printf("[NS] pre-end() heap: free=%u largest=%u\n",
+                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     http.end();
-    if (pausedBle) bleResume();
+    Serial.printf("[NS] post-end() heap: free=%u largest=%u\n",
+                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     return;
   }
 
@@ -910,7 +922,15 @@ void fetchNightscout() {
   }
   unsigned long readMs = millis() - tReadStart;
   nsBodyBuf[bodyLen] = '\0';
+  // Diagnostic: bisect exactly where a slow/incomplete transfer's heap cost
+  // lands — before end() (still-open socket + full TLS context) vs. after
+  // (should be released by stop_ssl_socket() inside http.end()->disconnect()).
+  Serial.printf("[NS] pre-end() heap: free=%u largest=%u (timedOut=%d)\n",
+                ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                bodyLen < (size_t)contentLen);
   http.end();
+  Serial.printf("[NS] post-end() heap: free=%u largest=%u\n",
+                ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   Serial.printf("[NS] timing: connect+headers=%lums  read=%lums (%u/%d bytes, RSSI %d dBm)\n",
                 tGetMs, readMs, (unsigned)bodyLen, contentLen, WiFi.RSSI());
 
@@ -922,21 +942,34 @@ void fetchNightscout() {
   // Filter must mirror the input's shape: NS returns a top-level array, so the
   // filter needs to be an array too — one template object applied to every
   // element — not a bare object (which silently matches nothing here).
-  JsonDocument filter;
-  JsonObject filterElem = filter.add<JsonObject>();
-  filterElem["sgv"]       = true;
-  filterElem["date"]      = true;
-  filterElem["direction"] = true;
+  //
+  // `filter` and `doc` are static and reused across fetch cycles rather than
+  // fresh stack locals: ArduinoJson's JsonDocument grows its internal pool via
+  // realloc() and deserializeJson() only clear()s it (keeps capacity, doesn't
+  // shrink) — see ArduinoJson/Deserialization/deserialize.hpp. A fresh
+  // JsonDocument every 5 minutes means a full alloc-to-fit + free every cycle,
+  // sized differently each time depending on how many raw entries/duplicate
+  // uploads NS returned — the same heap-churn pattern that fragmented the heap
+  // via String concatenation and HTTPClient::getString() before those were
+  // fixed. Reusing static instances lets the pool settle at a stable
+  // high-water mark instead of churning the allocator every cycle.
+  static JsonDocument filter;
+  static bool         filterBuilt = false;
+  if (!filterBuilt) {
+    JsonObject filterElem = filter.add<JsonObject>();
+    filterElem["sgv"]       = true;
+    filterElem["date"]      = true;
+    filterElem["direction"] = true;
+    filterBuilt = true;
+  }
 
-  JsonDocument doc;
+  static JsonDocument doc;
   DeserializationError err = deserializeJson(doc, nsBodyBuf, DeserializationOption::Filter(filter));
   if (err || !doc.is<JsonArray>() || doc.as<JsonArray>().size() == 0) {
     Serial.printf("[NS] JSON error: %s (body %u bytes)\n", err.c_str(), (unsigned)bodyLen);
-    if (pausedBle) bleResume();
+    doc.shrinkToFit();
     return;
   }
-
-  if (pausedBle) bleResume();
 
   JsonArray arr = doc.as<JsonArray>();
 
@@ -946,7 +979,10 @@ void fetchNightscout() {
   uint64_t dateMs = latest["date"] | (uint64_t)0;
   const char *dir = latest["direction"] | "NONE";
 
-  if (sgvMgDl <= 0) return;
+  if (sgvMgDl <= 0) {
+    doc.shrinkToFit();
+    return;
+  }
 
   // Source arbitration: WiFi/Nightscout is a fallback. If BLE (or a previous
   // fetch) already gave us a reading at least as recent as this one, keep it —
@@ -957,6 +993,7 @@ void fetchNightscout() {
       nsLatestTs <= timeStampLatestBgReadingInSecondsUTC) {
     Serial.printf("[NS] current data fresher (have %lu, ns %lu) — BLE wins, skip\n",
                   timeStampLatestBgReadingInSecondsUTC, nsLatestTs);
+    doc.shrinkToFit();
     return;
   }
 
@@ -988,10 +1025,13 @@ void fetchNightscout() {
     lastAcceptedTs = ts;
     slot++;
   }
-  saveHistoryToNVS();
 
   float coverageHours = lastAcceptedTs > 0
     ? (float)(nsLatestTs - lastAcceptedTs) / 3600.0f : 0.0f;
+
+  doc.shrinkToFit();
+
+  saveHistoryToNVS();
   Serial.printf("[NS] History: %d raw -> %d distinct slots, %.1fh coverage\n",
                 rawCount, slot, coverageHours);
   Serial.printf("[NS] OK: %.1f mmol/L %s (disconnects total: %d)\n",
@@ -1089,6 +1129,22 @@ class BLECharacteristicCallBack : public NimBLECharacteristicCallbacks {
           readingHistory[i].utcSec = (baseTs > 0) ? baseTs - (unsigned long)i * BG_PREFILL_INTERVAL_SEC : 0;
         }
         Serial.printf("History preloaded: %u points\n", count);
+      } break;
+
+      case 0x22: {  // Bolus history pre-fill — {utcSec uint32 BE, units uint16 BE hundredths} per entry
+        uint8_t count = rxBuf[1];
+        if (count > BOLUS_HISTORY_MAX) count = BOLUS_HISTORY_MAX;
+        if (!bleAuthenticated || rxLen < 3 + count * 6) break;
+        for (uint8_t i = 0; i < count; i++) {
+          int base = 3 + i * 6;
+          uint32_t ts = (uint32_t(rxBuf[base]) << 24) | (uint32_t(rxBuf[base+1]) << 16) |
+                        (uint32_t(rxBuf[base+2]) << 8) | rxBuf[base+3];
+          uint16_t unitsHundredths = (uint16_t(rxBuf[base+4]) << 8) | rxBuf[base+5];
+          bolusHistory[i].utcSec = ts;
+          bolusHistory[i].units  = unitsHundredths / 100.0f;
+        }
+        bolusHistoryCount = count;
+        Serial.printf("Bolus history preloaded: %u events\n", count);
       } break;
 
       case 0x20: {  // WatchDrip CYD update
@@ -1262,7 +1318,26 @@ void setup() {
                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   webConfigBegin(cfg, tft, displayColorsInverted);
   tft.println(F("Config: 192.168.4.1"));
-  setupBLE();  // BLE + WiFi coexist; fetchNightscout() pauses/resumes BLE only if heap ever gets tight
+
+  // BLE and WiFi/Nightscout used to coexist, with fetchNightscout() pausing
+  // BLE (NimBLEDevice::deinit()) around every HTTPS fetch to free heap for
+  // the TLS handshake. Confirmed on hardware that deinit() does NOT fully
+  // release what init() allocated — largest free block never recovered back
+  // to its pre-BLE baseline even after BLE was left fully off for 25+
+  // minutes following a single pause. Every 5-minute fetch cycle was bleeding
+  // heap permanently with no way to reclaim it short of a reboot — the actual
+  // cause of both the ~26h-uptime SSL failures and a hard abort()/reboot in
+  // esp_bt_controller_init() when it eventually ran out of contiguous memory.
+  // Since NS URL is only ever useful when WiFi is configured, and Nightscout
+  // (WiFi) is authoritative whenever it's available, don't start BLE at all
+  // in that case — WiFi-only devices never pause/resume BLE, so the leak
+  // never triggers. BLE stays the primary path when no NS URL is configured.
+  bool wifiIsPrimarySource = wifiEnabled && cfg.ns_url[0] != '\0';
+  if (!wifiIsPrimarySource) {
+    setupBLE();
+  } else {
+    Serial.println(F("[BLE] Skipped — WiFi + Nightscout configured as primary source"));
+  }
   Serial.printf("Post-BLE heap: free=%u  largest=%u\n",
                 ESP.getFreeHeap(),
                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
